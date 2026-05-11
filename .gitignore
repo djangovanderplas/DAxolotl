@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Local state
+*.db
+*.db-journal
+.env
+
+# OS
+.DS_Store
+
+# Data files — preserve folder structure, not contents
+data/**/*
+!data/.gitkeep
+!data/*/
