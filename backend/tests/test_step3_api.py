@@ -167,6 +167,54 @@ def test_channel_data_endpoint_filters_and_caches_server_side(
         assert cached.json()["y"] == body["y"]
         assert len(list((settings.data_dir / ".processed" / "filters").glob("*.parquet"))) == 1
 
+        butterworth = client.get(
+            f"/api/datasets/{dataset_id}/channels/{channel['id']}/data",
+            params={
+                "filter_kind": "butterworth",
+                "cutoff_hz": 20,
+                "order": 4,
+                "max_points": 2000,
+            },
+        )
+        assert butterworth.status_code == 200, butterworth.text
+        assert butterworth.json()["point_count"] == 1000
+
+
+def test_channel_data_endpoint_accepts_butterworth_query_params(
+    monkeypatch,
+    tmp_path: Path,
+    synthetic_tdms: Path,
+) -> None:
+    with _client(monkeypatch, tmp_path) as client:
+        created = _ingest_synthetic(client, synthetic_tdms)
+        dataset_id = created["id"]
+        channel = next(ch for ch in created["channels"] if ch["name"] == "Chamber Eth")
+
+        response = client.get(
+            f"/api/datasets/{dataset_id}/channels/{channel['id']}/data",
+            params={
+                "filter_kind": "butterworth",
+                "cutoff_hz": 20,
+                "order": 4,
+                "max_points": 2000,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["point_count"] == 1000
+        assert body["full_point_count"] == 1000
+
+        invalid_order = client.get(
+            f"/api/datasets/{dataset_id}/channels/{channel['id']}/data",
+            params={
+                "filter_kind": "butterworth",
+                "cutoff_hz": 20,
+                "order": 3,
+            },
+        )
+        assert invalid_order.status_code == 400
+
 
 def test_dataset_and_channel_errors(monkeypatch, tmp_path: Path, synthetic_tdms: Path) -> None:
     with _client(monkeypatch, tmp_path) as client:

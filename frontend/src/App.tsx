@@ -57,7 +57,45 @@ type PlotElement = HTMLDivElement & {
   removeListener?: (eventName: string, handler: (event: Record<string, unknown>) => void) => void;
 };
 
+type PlotLayout = 'single' | 'columns' | 'rows' | 'grid';
+
+type PlotConfig = {
+  id: string;
+  name: string;
+  signalIds: number[];
+  valveIds: number[];
+  resolution: PlotResolution;
+  filter: FilterConfig;
+  maxPoints: number;
+};
+
+type PlotTab = {
+  id: string;
+  name: string;
+  layout: PlotLayout;
+  plots: PlotConfig[];
+};
+
+type PlotSummary = {
+  state: LoadState;
+  displayedPoints: number;
+  fullPoints: number;
+  error: string | null;
+};
+
+type PersistedSession = {
+  version: 1;
+  selectedDatasetId: number | null;
+  tabs: PlotTab[];
+  activeTabId: string | null;
+  activePlotId: string | null;
+  nextTabNumber: number;
+  nextPlotNumber: number;
+};
+
 const MAX_POINTS = 4000;
+const CURRENT_SESSION_KEY = 'daxolotl.currentSession';
+const SAVED_SESSION_KEY = 'daxolotl.savedSession';
 const TRACE_COLORS = ['#38bdf8', '#f97316', '#a78bfa', '#22c55e', '#f43f5e', '#eab308'];
 const VALVE_COLORS = ['#facc15', '#fb7185', '#34d399', '#60a5fa', '#c084fc', '#f97316'];
 const DEFAULT_FILTER: FilterConfig = {
@@ -77,18 +115,6 @@ function signalChannels(channels: Channel[]): Channel[] {
 
 function valveChannels(channels: Channel[]): Channel[] {
   return displayChannels(channels).filter((channel) => channel.is_valve);
-}
-
-function chooseDefaultSignalIds(channels: Channel[]): number[] {
-  const signals = signalChannels(channels);
-  const preferred = ['Chamber Eth', 'Chamber LOx']
-    .map((name) =>
-      signals.find((channel) => channel.group_name === 'Pressure Sensors' && channel.name === name),
-    )
-    .filter((channel): channel is Channel => Boolean(channel));
-
-  if (preferred.length > 0) return preferred.map((channel) => channel.id);
-  return signals[0] ? [signals[0].id] : [];
 }
 
 function groupChannels(channels: Channel[]): Array<[string, Channel[]]> {
@@ -241,103 +267,127 @@ function parseRelayoutWindow(event: Record<string, unknown>): TimeWindow | null 
   return undefined;
 }
 
-function maxPointsForPlotWidth(width: number): number {
-  if (width < 100) return MAX_POINTS;
-  return Math.round(Math.min(12000, Math.max(2000, width * 3)));
+function defaultPlot(id: string, name: string, signalIds: number[]): PlotConfig {
+  return {
+    id,
+    name,
+    signalIds,
+    valveIds: [],
+    resolution: 'fast',
+    filter: { ...DEFAULT_FILTER },
+    maxPoints: MAX_POINTS,
+  };
 }
 
-export default function App() {
+function freshSession(datasetId: number | null): PersistedSession {
+  return {
+    version: 1,
+    selectedDatasetId: datasetId,
+    tabs: [
+      {
+        id: 'tab-1',
+        name: 'Tab 1',
+        layout: 'single',
+        plots: [defaultPlot('plot-1', 'Plot 1', [])],
+      },
+    ],
+    activeTabId: 'tab-1',
+    activePlotId: 'plot-1',
+    nextTabNumber: 2,
+    nextPlotNumber: 2,
+  };
+}
+
+function serializeSession(session: PersistedSession): string {
+  return JSON.stringify(session);
+}
+
+function parseStoredSession(value: string | null): PersistedSession | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PersistedSession>;
+    if (
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.tabs) ||
+      typeof parsed.nextTabNumber !== 'number' ||
+      typeof parsed.nextPlotNumber !== 'number'
+    ) {
+      return null;
+    }
+    return {
+      version: 1,
+      selectedDatasetId:
+        typeof parsed.selectedDatasetId === 'number' ? parsed.selectedDatasetId : null,
+      tabs: parsed.tabs,
+      activeTabId: typeof parsed.activeTabId === 'string' ? parsed.activeTabId : null,
+      activePlotId: typeof parsed.activePlotId === 'string' ? parsed.activePlotId : null,
+      nextTabNumber: parsed.nextTabNumber,
+      nextPlotNumber: parsed.nextPlotNumber,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function validSessionForDatasets(
+  session: PersistedSession | null,
+  datasets: DatasetSummary[],
+): PersistedSession | null {
+  if (!session || session.tabs.length === 0) return null;
+  const datasetIds = new Set(datasets.map((dataset) => dataset.id));
+  if (session.selectedDatasetId !== null && !datasetIds.has(session.selectedDatasetId)) return null;
+  if (session.tabs.some((tab) => tab.plots.length === 0)) return null;
+  return session;
+}
+
+function clampMaxPoints(value: number): number {
+  return Number.isFinite(value) ? Math.min(100000, Math.max(500, Math.round(value))) : MAX_POINTS;
+}
+
+function layoutClass(layout: PlotLayout): string {
+  if (layout === 'columns') return 'grid-cols-2';
+  if (layout === 'rows') return 'grid-cols-1 grid-rows-2';
+  if (layout === 'grid') return 'grid-cols-2 auto-rows-fr';
+  return 'grid-cols-1';
+}
+
+function PlotCell({
+  datasetId,
+  plot,
+  active,
+  canRemove,
+  onSelect,
+  onSplit,
+  onRemove,
+  onSummary,
+}: {
+  datasetId: number | null;
+  plot: PlotConfig;
+  active: boolean;
+  canRemove: boolean;
+  onSelect: () => void;
+  onSplit: (direction: 'horizontal' | 'vertical') => void;
+  onRemove: () => void;
+  onSummary: (plotId: string, summary: PlotSummary) => void;
+}) {
   const plotRef = useRef<HTMLDivElement | null>(null);
   const relayoutTimerRef = useRef<number | null>(null);
-  const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
-  const [selectedDatasetId, setSelectedDatasetId] = useState<number | null>(null);
-  const [draftSignalIds, setDraftSignalIds] = useState<number[]>([]);
-  const [draftValveIds, setDraftValveIds] = useState<number[]>([]);
-  const [draftResolution, setDraftResolution] = useState<PlotResolution>('fast');
-  const [plotSignalIds, setPlotSignalIds] = useState<number[]>([]);
-  const [plotValveIds, setPlotValveIds] = useState<number[]>([]);
-  const [plotResolution, setPlotResolution] = useState<PlotResolution>('fast');
-  const [filter, setFilter] = useState<FilterConfig>(DEFAULT_FILTER);
   const [visibleWindow, setVisibleWindow] = useState<TimeWindow | null>(null);
-  const [displayMaxPoints, setDisplayMaxPoints] = useState(MAX_POINTS);
   const [signalData, setSignalData] = useState<ChannelData[]>([]);
   const [valveData, setValveData] = useState<ChannelData[]>([]);
-  const [datasetState, setDatasetState] = useState<LoadState>('idle');
   const [plotState, setPlotState] = useState<LoadState>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
 
-  const selectedDataset = useMemo(
-    () => datasets.find((dataset) => dataset.id === selectedDatasetId) ?? null,
-    [datasets, selectedDatasetId],
-  );
-
-  const groupedSignals = useMemo(
-    () => groupChannels(signalChannels(selectedDataset?.channels ?? [])),
-    [selectedDataset],
-  );
-  const availableValves = useMemo(
-    () => valveChannels(selectedDataset?.channels ?? []),
-    [selectedDataset],
-  );
-
-  const setupDirty =
-    !sameIds(draftSignalIds, plotSignalIds) ||
-    !sameIds(draftValveIds, plotValveIds) ||
-    draftResolution !== plotResolution;
   const totalDisplayedPoints = signalData.reduce((total, data) => total + data.point_count, 0);
   const totalFullPoints = signalData.reduce((total, data) => total + data.full_point_count, 0);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadDatasets() {
-      setDatasetState('loading');
-      setError(null);
-      try {
-        const listResponse = await fetch('/api/datasets');
-        if (!listResponse.ok) throw new Error(`Datasets HTTP ${listResponse.status}`);
-        const summaries = (await listResponse.json()) as DatasetSummary[];
-
-        const detailed = await Promise.all(
-          summaries.map(async (summary) => {
-            const response = await fetch(`/api/datasets/${summary.id}`);
-            if (!response.ok) throw new Error(`Dataset ${summary.id} HTTP ${response.status}`);
-            return (await response.json()) as DatasetSummary;
-          }),
-        );
-
-        if (cancelled) return;
-        setDatasets(detailed);
-
-        const firstDataset = detailed[0] ?? null;
-        const defaultSignals = chooseDefaultSignalIds(firstDataset?.channels ?? []);
-        setSelectedDatasetId(firstDataset?.id ?? null);
-        setDraftSignalIds(defaultSignals);
-        setDraftValveIds([]);
-        setDraftResolution('fast');
-        setPlotSignalIds(defaultSignals);
-        setPlotValveIds([]);
-        setPlotResolution('fast');
-        setVisibleWindow(null);
-        setDatasetState('ready');
-      } catch (err) {
-        if (cancelled) return;
-        setDatasetState('error');
-        setError(err instanceof Error ? err.message : 'Unable to load datasets');
-      }
-    }
-
-    void loadDatasets();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!selectedDatasetId || plotSignalIds.length === 0) {
+    if (!datasetId || plot.signalIds.length === 0) {
       setSignalData([]);
       setValveData([]);
       setPlotState('idle');
+      setError(null);
       return;
     }
 
@@ -346,18 +396,18 @@ export default function App() {
       setPlotState('loading');
       setError(null);
       try {
-        const ids = [...plotSignalIds, ...plotValveIds];
-        const signalIdSet = new Set(plotSignalIds);
+        const ids = [...plot.signalIds, ...plot.valveIds];
+        const signalIdSet = new Set(plot.signalIds);
         const responses = await Promise.all(
           ids.map(async (channelId) => {
-            const channelFilter = signalIdSet.has(channelId) ? filter : DEFAULT_FILTER;
+            const channelFilter = signalIdSet.has(channelId) ? plot.filter : DEFAULT_FILTER;
             const params = new URLSearchParams();
             addFilterParams(params, channelFilter);
             if (visibleWindow) {
               params.set('t_min', String(visibleWindow.tMin));
               params.set('t_max', String(visibleWindow.tMax));
             }
-            params.set('max_points', String(displayMaxPoints));
+            params.set('max_points', String(plot.maxPoints));
 
             const fullBody = {
               ...(visibleWindow
@@ -369,18 +419,15 @@ export default function App() {
               filter: filterBody(channelFilter),
             };
             const response =
-              plotResolution === 'full'
-                ? await fetch(
-                    `/api/datasets/${selectedDatasetId}/channels/${channelId}/data/full`,
-                    {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify(fullBody),
-                      signal: controller.signal,
-                    },
-                  )
+              plot.resolution === 'full'
+                ? await fetch(`/api/datasets/${datasetId}/channels/${channelId}/data/full`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(fullBody),
+                    signal: controller.signal,
+                  })
                 : await fetch(
-                    `/api/datasets/${selectedDatasetId}/channels/${channelId}/data?${params.toString()}`,
+                    `/api/datasets/${datasetId}/channels/${channelId}/data?${params.toString()}`,
                     { signal: controller.signal },
                   );
             if (!response.ok) throw new Error(`Channel data HTTP ${response.status}`);
@@ -401,19 +448,20 @@ export default function App() {
 
     void loadPlotData();
     return () => controller.abort();
-  }, [
-    selectedDatasetId,
-    plotSignalIds,
-    plotValveIds,
-    plotResolution,
-    filter,
-    visibleWindow,
-    displayMaxPoints,
-  ]);
+  }, [datasetId, plot, visibleWindow]);
 
   useEffect(() => {
-    const plot = plotRef.current;
-    if (!plot || signalData.length === 0) return;
+    onSummary(plot.id, {
+      state: plotState,
+      displayedPoints: totalDisplayedPoints,
+      fullPoints: totalFullPoints,
+      error,
+    });
+  }, [error, onSummary, plot.id, plotState, totalDisplayedPoints, totalFullPoints]);
+
+  useEffect(() => {
+    const plotElement = plotRef.current;
+    if (!plotElement || signalData.length === 0) return;
 
     const units = [...new Set(signalData.map((data) => data.unit).filter(Boolean))];
     const yLabel = units.length === 1 ? `Signals [${units[0]}]` : 'Signals';
@@ -425,14 +473,14 @@ export default function App() {
         : `${signalData.length} traces`;
     const overlayText = valveSummary(valveData);
     const filterText =
-      filter.kind === 'none'
+      plot.filter.kind === 'none'
         ? ''
-        : filter.kind === 'butterworth'
-          ? ` · Butterworth ${filter.cutoffHz} Hz`
-          : ` · Avg ${filter.windowSamples} samples`;
+        : plot.filter.kind === 'butterworth'
+          ? ` · Butterworth ${plot.filter.cutoffHz} Hz`
+          : ` · Avg ${plot.filter.windowSamples} samples`;
 
     void Plotly.react(
-      plot,
+      plotElement,
       signalData.map((data, index) => ({
         x: data.t,
         y: data.y,
@@ -447,7 +495,7 @@ export default function App() {
         paper_bgcolor: '#020617',
         plot_bgcolor: '#0f172a',
         font: { color: '#cbd5e1', family: 'Inter, ui-sans-serif, system-ui' },
-        uirevision: 'plot-1',
+        uirevision: plot.id,
         margin: {
           l: 72,
           r: 28,
@@ -496,29 +544,22 @@ export default function App() {
         scrollZoom: true,
       },
     );
-  }, [signalData, valveData, filter]);
+  }, [plot.filter, plot.id, signalData, valveData]);
 
   useEffect(() => {
-    const plot = plotRef.current;
-    if (!plot) return;
-
-    const syncMaxPoints = () => {
-      const nextMaxPoints = maxPointsForPlotWidth(plot.clientWidth);
-      setDisplayMaxPoints((current) => (current === nextMaxPoints ? current : nextMaxPoints));
-    };
-    syncMaxPoints();
+    const plotElement = plotRef.current;
+    if (!plotElement) return;
 
     const resizeObserver = new ResizeObserver(() => {
-      syncMaxPoints();
-      void Plotly.Plots.resize(plot);
+      void Plotly.Plots.resize(plotElement);
     });
-    resizeObserver.observe(plot);
+    resizeObserver.observe(plotElement);
     return () => resizeObserver.disconnect();
   }, []);
 
   useEffect(() => {
-    const plot = plotRef.current as PlotElement | null;
-    if (!plot?.on) return;
+    const plotElement = plotRef.current as PlotElement | null;
+    if (!plotElement?.on) return;
 
     const handleRelayout = (event: Record<string, unknown>) => {
       const nextWindow = parseRelayoutWindow(event);
@@ -531,39 +572,477 @@ export default function App() {
       }, 200);
     };
 
-    plot.on('plotly_relayout', handleRelayout);
+    plotElement.on('plotly_relayout', handleRelayout);
     return () => {
       if (relayoutTimerRef.current !== null) {
         window.clearTimeout(relayoutTimerRef.current);
       }
-      plot.removeListener?.('plotly_relayout', handleRelayout);
+      plotElement.removeListener?.('plotly_relayout', handleRelayout);
     };
   }, [signalData.length]);
 
+  useEffect(() => {
+    if (!menuPosition) return;
+    const closeMenu = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      setMenuPosition(null);
+    };
+    const closeMenuOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenuPosition(null);
+    };
+    window.addEventListener('mousedown', closeMenu);
+    window.addEventListener('keydown', closeMenuOnEscape);
+    return () => {
+      window.removeEventListener('mousedown', closeMenu);
+      window.removeEventListener('keydown', closeMenuOnEscape);
+    };
+  }, [menuPosition]);
+
+  return (
+    <div
+      className={`flex min-h-0 flex-col border bg-slate-900 ${
+        active ? 'border-sky-500' : 'border-slate-800'
+      }`}
+      onClick={onSelect}
+      onMouseDown={(event) => {
+        if (event.button !== 2) return;
+        event.preventDefault();
+        onSelect();
+        setMenuPosition({ x: event.clientX, y: event.clientY });
+      }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onSelect();
+        setMenuPosition({ x: event.clientX, y: event.clientY });
+      }}
+    >
+      <div className="flex h-9 shrink-0 items-center border-b border-slate-800 bg-slate-900 px-2">
+        <button
+          className={`h-7 rounded border px-2 text-xs font-medium ${
+            active
+              ? 'border-sky-500 bg-sky-500/15 text-sky-100'
+              : 'border-slate-700 bg-slate-950 text-slate-300'
+          }`}
+          type="button"
+        >
+          {plot.name}
+        </button>
+        <div className="ml-auto font-mono text-xs text-slate-500">
+          {plotState === 'loading'
+            ? 'loading'
+            : `${plot.resolution} · ${formatCount(totalDisplayedPoints)} / ${formatCount(
+                totalFullPoints,
+              )} points`}
+        </div>
+      </div>
+      <div className="relative min-h-0 flex-1">
+        <div ref={plotRef} className="h-full min-h-[260px] w-full bg-slate-900" />
+        {error ? (
+          <div className="absolute left-3 top-3 rounded border border-rose-500/60 bg-rose-950 px-3 py-2 text-sm text-rose-100">
+            {error}
+          </div>
+        ) : null}
+        {menuPosition ? (
+          <div
+            className="fixed z-50 w-36 rounded border border-slate-700 bg-slate-950 py-1 text-sm shadow-xl shadow-slate-950/40"
+            style={{ left: menuPosition.x, top: menuPosition.y }}
+            onClick={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button
+              className="block h-8 w-full px-3 text-left text-slate-200 hover:bg-slate-800"
+              type="button"
+              onClick={() => {
+                setMenuPosition(null);
+                onSplit('vertical');
+              }}
+            >
+              Split vertical
+            </button>
+            <button
+              className="block h-8 w-full px-3 text-left text-slate-200 hover:bg-slate-800"
+              type="button"
+              onClick={() => {
+                setMenuPosition(null);
+                onSplit('horizontal');
+              }}
+            >
+              Split horizontal
+            </button>
+            <button
+              className="block h-8 w-full px-3 text-left text-rose-200 hover:bg-rose-950 disabled:text-slate-600 disabled:hover:bg-transparent"
+              disabled={!canRemove}
+              type="button"
+              onClick={() => {
+                setMenuPosition(null);
+                onRemove();
+              }}
+            >
+              Remove plot
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
+  const [selectedDatasetId, setSelectedDatasetId] = useState<number | null>(null);
+  const [tabs, setTabs] = useState<PlotTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [activePlotId, setActivePlotId] = useState<string | null>(null);
+  const [plotSummaries, setPlotSummaries] = useState<Record<string, PlotSummary>>({});
+  const [nextTabNumber, setNextTabNumber] = useState(2);
+  const [nextPlotNumber, setNextPlotNumber] = useState(2);
+  const [draftSignalIds, setDraftSignalIds] = useState<number[]>([]);
+  const [draftValveIds, setDraftValveIds] = useState<number[]>([]);
+  const [draftResolution, setDraftResolution] = useState<PlotResolution>('fast');
+  const [filter, setFilter] = useState<FilterConfig>(DEFAULT_FILTER);
+  const [cutoffDraft, setCutoffDraft] = useState(String(DEFAULT_FILTER.cutoffHz));
+  const [windowDraft, setWindowDraft] = useState(String(DEFAULT_FILTER.windowSamples));
+  const [maxPointsDraft, setMaxPointsDraft] = useState(String(MAX_POINTS));
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+  const [renamingTabName, setRenamingTabName] = useState('');
+  const [savedSnapshot, setSavedSnapshot] = useState<string | null>(null);
+  const [datasetState, setDatasetState] = useState<LoadState>('idle');
+  const [error, setError] = useState<string | null>(null);
+
+  const sessionSnapshot = useMemo(
+    () =>
+      serializeSession({
+        version: 1,
+        selectedDatasetId,
+        tabs,
+        activeTabId,
+        activePlotId,
+        nextTabNumber,
+        nextPlotNumber,
+      }),
+    [activePlotId, activeTabId, nextPlotNumber, nextTabNumber, selectedDatasetId, tabs],
+  );
+  const sessionDirty = tabs.length > 0 && sessionSnapshot !== savedSnapshot;
+
+  const selectedDataset = useMemo(
+    () => datasets.find((dataset) => dataset.id === selectedDatasetId) ?? null,
+    [datasets, selectedDatasetId],
+  );
+
+  const activeTab = useMemo(
+    () => tabs.find((tab) => tab.id === activeTabId) ?? tabs[0] ?? null,
+    [activeTabId, tabs],
+  );
+  const activePlot = useMemo(
+    () => activeTab?.plots.find((plot) => plot.id === activePlotId) ?? activeTab?.plots[0] ?? null,
+    [activePlotId, activeTab],
+  );
+
+  const groupedSignals = useMemo(
+    () => groupChannels(signalChannels(selectedDataset?.channels ?? [])),
+    [selectedDataset],
+  );
+  const availableValves = useMemo(
+    () => valveChannels(selectedDataset?.channels ?? []),
+    [selectedDataset],
+  );
+
+  const setupDirty = activePlot
+    ? !sameIds(draftSignalIds, activePlot.signalIds) ||
+      !sameIds(draftValveIds, activePlot.valveIds) ||
+      draftResolution !== activePlot.resolution
+    : false;
+  const activeSummary = activePlot ? plotSummaries[activePlot.id] : null;
+
+  const updatePlot = useCallback((plotId: string, updater: (plot: PlotConfig) => PlotConfig) => {
+    setTabs((currentTabs) =>
+      currentTabs.map((tab) => ({
+        ...tab,
+        plots: tab.plots.map((plot) => (plot.id === plotId ? updater(plot) : plot)),
+      })),
+    );
+  }, []);
+
+  const updateActivePlot = useCallback(
+    (updater: (plot: PlotConfig) => PlotConfig) => {
+      if (!activePlot) return;
+      updatePlot(activePlot.id, updater);
+    },
+    [activePlot, updatePlot],
+  );
+
+  const handlePlotSummary = useCallback((plotId: string, summary: PlotSummary) => {
+    setPlotSummaries((current) => ({ ...current, [plotId]: summary }));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDatasets() {
+      setDatasetState('loading');
+      setError(null);
+      try {
+        const listResponse = await fetch('/api/datasets');
+        if (!listResponse.ok) throw new Error(`Datasets HTTP ${listResponse.status}`);
+        const summaries = (await listResponse.json()) as DatasetSummary[];
+
+        const detailed = await Promise.all(
+          summaries.map(async (summary) => {
+            const response = await fetch(`/api/datasets/${summary.id}`);
+            if (!response.ok) throw new Error(`Dataset ${summary.id} HTTP ${response.status}`);
+            return (await response.json()) as DatasetSummary;
+          }),
+        );
+
+        if (cancelled) return;
+        setDatasets(detailed);
+
+        const firstDataset = detailed[0] ?? null;
+        const saved = localStorage.getItem(SAVED_SESSION_KEY);
+        const restored = validSessionForDatasets(
+          parseStoredSession(localStorage.getItem(CURRENT_SESSION_KEY)),
+          detailed,
+        );
+        const initialSession = restored ?? freshSession(firstDataset?.id ?? null);
+        setSelectedDatasetId(initialSession.selectedDatasetId);
+        setTabs(initialSession.tabs);
+        setActiveTabId(initialSession.activeTabId);
+        setActivePlotId(initialSession.activePlotId);
+        setNextTabNumber(initialSession.nextTabNumber);
+        setNextPlotNumber(initialSession.nextPlotNumber);
+        setSavedSnapshot(saved);
+        setPlotSummaries({});
+        setDatasetState('ready');
+      } catch (err) {
+        if (cancelled) return;
+        setDatasetState('error');
+        setError(err instanceof Error ? err.message : 'Unable to load datasets');
+      }
+    }
+
+    void loadDatasets();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (tabs.length === 0) return;
+    localStorage.setItem(CURRENT_SESSION_KEY, sessionSnapshot);
+  }, [sessionSnapshot, tabs.length]);
+
+  useEffect(() => {
+    if (!activePlot) return;
+    setDraftSignalIds(activePlot.signalIds);
+    setDraftValveIds(activePlot.valveIds);
+    setDraftResolution(activePlot.resolution);
+    setFilter(activePlot.filter);
+    setCutoffDraft(String(activePlot.filter.cutoffHz));
+    setWindowDraft(String(activePlot.filter.windowSamples));
+    setMaxPointsDraft(String(activePlot.maxPoints));
+  }, [activePlot]);
+
+  const confirmDiscardSession = useCallback(() => {
+    if (!sessionDirty) return true;
+    return window.confirm('Current session has unsaved changes. Continue?');
+  }, [sessionDirty]);
+
+  const applySession = useCallback((session: PersistedSession) => {
+    setSelectedDatasetId(session.selectedDatasetId);
+    setTabs(session.tabs);
+    setActiveTabId(session.activeTabId);
+    setActivePlotId(session.activePlotId);
+    setNextTabNumber(session.nextTabNumber);
+    setNextPlotNumber(session.nextPlotNumber);
+    setPlotSummaries({});
+  }, []);
+
+  const handleNewSession = useCallback(() => {
+    if (!confirmDiscardSession()) return;
+    const firstDatasetId = datasets[0]?.id ?? null;
+    applySession(freshSession(firstDatasetId));
+    setSavedSnapshot(null);
+    setError(null);
+  }, [applySession, confirmDiscardSession, datasets]);
+
+  const handleSaveSession = useCallback(() => {
+    localStorage.setItem(SAVED_SESSION_KEY, sessionSnapshot);
+    localStorage.setItem(CURRENT_SESSION_KEY, sessionSnapshot);
+    setSavedSnapshot(sessionSnapshot);
+    setError(null);
+  }, [sessionSnapshot]);
+
+  const handleOpenSession = useCallback(() => {
+    if (!confirmDiscardSession()) return;
+    const stored = localStorage.getItem(SAVED_SESSION_KEY);
+    const session = validSessionForDatasets(parseStoredSession(stored), datasets);
+    if (!session || !stored) {
+      setError('No saved session found for the loaded datasets.');
+      return;
+    }
+    applySession(session);
+    setSavedSnapshot(stored);
+    setError(null);
+  }, [applySession, confirmDiscardSession, datasets]);
+
   const handleDatasetChange = useCallback(
     (datasetId: number) => {
+      if (!confirmDiscardSession()) return;
       const dataset = datasets.find((item) => item.id === datasetId) ?? null;
-      const defaultSignals = chooseDefaultSignalIds(dataset?.channels ?? []);
-      setSelectedDatasetId(dataset?.id ?? null);
-      setDraftSignalIds(defaultSignals);
-      setDraftValveIds([]);
-      setDraftResolution('fast');
-      setPlotSignalIds(defaultSignals);
-      setPlotValveIds([]);
-      setPlotResolution('fast');
-      setVisibleWindow(null);
+      applySession(freshSession(dataset?.id ?? null));
+      setSavedSnapshot(null);
+      setError(null);
     },
-    [datasets],
+    [applySession, confirmDiscardSession, datasets],
   );
 
   const applySetup = useCallback(() => {
-    setPlotSignalIds(draftSignalIds);
-    setPlotValveIds(draftValveIds);
-    setPlotResolution(draftResolution);
-  }, [draftSignalIds, draftValveIds, draftResolution]);
+    updateActivePlot((plot) => ({
+      ...plot,
+      signalIds: draftSignalIds,
+      valveIds: draftValveIds,
+      resolution: draftResolution,
+    }));
+  }, [draftSignalIds, draftResolution, draftValveIds, updateActivePlot]);
+
+  const updateActiveFilter = useCallback(
+    (nextFilter: FilterConfig) => {
+      setFilter(nextFilter);
+      updateActivePlot((plot) => ({ ...plot, filter: nextFilter }));
+    },
+    [updateActivePlot],
+  );
+
+  const updateActiveMaxPoints = useCallback(
+    (maxPoints: number) => {
+      const nextMaxPoints = clampMaxPoints(maxPoints);
+      setMaxPointsDraft(String(nextMaxPoints));
+      updateActivePlot((plot) => ({ ...plot, maxPoints: nextMaxPoints }));
+    },
+    [updateActivePlot],
+  );
+
+  const commitCutoffDraft = useCallback(() => {
+    const value = Number(cutoffDraft);
+    if (!Number.isFinite(value) || value <= 0) {
+      setCutoffDraft(String(filter.cutoffHz));
+      return;
+    }
+    updateActiveFilter({ ...filter, cutoffHz: value });
+  }, [cutoffDraft, filter, updateActiveFilter]);
+
+  const commitWindowDraft = useCallback(() => {
+    const value = Number(windowDraft);
+    if (!Number.isFinite(value) || value < 1) {
+      setWindowDraft(String(filter.windowSamples));
+      return;
+    }
+    updateActiveFilter({ ...filter, windowSamples: Math.max(1, Math.round(value)) });
+  }, [filter, updateActiveFilter, windowDraft]);
+
+  const commitMaxPointsDraft = useCallback(() => {
+    updateActiveMaxPoints(Number(maxPointsDraft));
+  }, [maxPointsDraft, updateActiveMaxPoints]);
+
+  const beginRenameTab = useCallback((tab: PlotTab) => {
+    setRenamingTabId(tab.id);
+    setRenamingTabName(tab.name);
+  }, []);
+
+  const commitRenameTab = useCallback(() => {
+    if (!renamingTabId) return;
+    const nextName = renamingTabName.trim();
+    if (nextName) {
+      setTabs((currentTabs) =>
+        currentTabs.map((tab) => (tab.id === renamingTabId ? { ...tab, name: nextName } : tab)),
+      );
+    }
+    setRenamingTabId(null);
+    setRenamingTabName('');
+  }, [renamingTabId, renamingTabName]);
+
+  const cancelRenameTab = useCallback(() => {
+    setRenamingTabId(null);
+    setRenamingTabName('');
+  }, []);
+
+  const addTab = useCallback(() => {
+    const tabId = `tab-${nextTabNumber}`;
+    const plotId = `plot-${nextPlotNumber}`;
+    const newPlot = defaultPlot(plotId, `Plot ${nextPlotNumber}`, []);
+    setTabs((currentTabs) => [
+      ...currentTabs,
+      { id: tabId, name: `Tab ${nextTabNumber}`, layout: 'single', plots: [newPlot] },
+    ]);
+    setActiveTabId(tabId);
+    setActivePlotId(plotId);
+    setNextTabNumber((value) => value + 1);
+    setNextPlotNumber((value) => value + 1);
+  }, [nextPlotNumber, nextTabNumber]);
+
+  const splitPlot = useCallback(
+    (plotToSplitId: string, direction: 'horizontal' | 'vertical') => {
+      const tabToSplit = tabs.find((tab) => tab.plots.some((plot) => plot.id === plotToSplitId));
+      if (!tabToSplit || tabToSplit.plots.length >= 4) return;
+      const plotId = `plot-${nextPlotNumber}`;
+      const newPlot = defaultPlot(plotId, `Plot ${nextPlotNumber}`, []);
+      setTabs((currentTabs) =>
+        currentTabs.map((tab) => {
+          if (tab.id !== tabToSplit.id) return tab;
+          const nextPlots = [...tab.plots, newPlot];
+          const nextLayout: PlotLayout =
+            nextPlots.length > 2 ? 'grid' : direction === 'vertical' ? 'columns' : 'rows';
+          return { ...tab, layout: nextLayout, plots: nextPlots };
+        }),
+      );
+      setActiveTabId(tabToSplit.id);
+      setActivePlotId(plotId);
+      setNextPlotNumber((value) => value + 1);
+    },
+    [nextPlotNumber, tabs],
+  );
+
+  const splitActivePlot = useCallback(
+    (direction: 'horizontal' | 'vertical') => {
+      if (!activePlot) return;
+      splitPlot(activePlot.id, direction);
+    },
+    [activePlot, splitPlot],
+  );
+
+  const removePlot = useCallback(
+    (plotId: string) => {
+      const tabWithPlot = tabs.find((tab) => tab.plots.some((plot) => plot.id === plotId));
+      if (!tabWithPlot || tabWithPlot.plots.length <= 1) return;
+      const remainingPlots = tabWithPlot.plots.filter((plot) => plot.id !== plotId);
+      const nextActivePlotId =
+        activePlotId === plotId ? (remainingPlots[0]?.id ?? null) : activePlotId;
+      setTabs((currentTabs) =>
+        currentTabs.map((tab) => {
+          if (tab.id !== tabWithPlot.id) return tab;
+          const nextLayout: PlotLayout =
+            remainingPlots.length === 1
+              ? 'single'
+              : remainingPlots.length === 2
+                ? 'columns'
+                : 'grid';
+          return { ...tab, layout: nextLayout, plots: remainingPlots };
+        }),
+      );
+      setActiveTabId(tabWithPlot.id);
+      setActivePlotId(nextActivePlotId);
+      setPlotSummaries((current) => {
+        const next = { ...current };
+        delete next[plotId];
+        return next;
+      });
+    },
+    [activePlotId, tabs],
+  );
 
   const hasDatasets = datasets.length > 0;
-  const canApply = draftSignalIds.length > 0 && setupDirty;
+  const canApply = Boolean(activePlot && setupDirty);
+  const canSplit = Boolean(activeTab && activePlot && activeTab.plots.length < 4);
 
   return (
     <main className="h-screen overflow-hidden bg-slate-950 text-slate-100">
@@ -571,7 +1050,9 @@ export default function App() {
         <aside className="flex h-[44vh] w-full shrink-0 flex-col border-b border-slate-800 bg-slate-900/95 lg:h-full lg:w-96 lg:border-b-0 lg:border-r">
           <div className="border-b border-slate-800 px-4 py-3">
             <div className="text-lg font-semibold tracking-tight">DAxolotl</div>
-            <div className="mt-1 text-xs text-slate-400">plot setup</div>
+            <div className="mt-1 text-xs text-slate-400">
+              {activePlot ? `${activeTab?.name ?? 'Tab'} / ${activePlot.name}` : 'plot setup'}
+            </div>
           </div>
 
           <div className="border-b border-slate-800 p-3">
@@ -736,14 +1217,104 @@ export default function App() {
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-11 shrink-0 items-center border-b border-slate-800 bg-slate-900 px-3">
-            <button
-              className="h-8 whitespace-nowrap rounded border border-sky-500 bg-sky-500/15 px-3 text-sm font-medium text-sky-100"
-              type="button"
-            >
-              Plot 1
-            </button>
-            <div className="ml-3 flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs">
+          <div className="flex h-12 shrink-0 items-center gap-2 border-b border-slate-800 bg-slate-900 px-3">
+            <div className="flex shrink-0 items-center gap-1 border-r border-slate-800 pr-2">
+              <button
+                className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-300 hover:border-sky-500 hover:text-sky-100"
+                type="button"
+                onClick={handleNewSession}
+              >
+                New
+              </button>
+              <button
+                className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-300 hover:border-sky-500 hover:text-sky-100"
+                type="button"
+                onClick={handleSaveSession}
+              >
+                Save
+              </button>
+              <button
+                className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-300 hover:border-sky-500 hover:text-sky-100"
+                type="button"
+                onClick={handleOpenSession}
+              >
+                Open
+              </button>
+              <span
+                className={`ml-1 rounded border px-2 py-1 font-mono text-[11px] ${
+                  sessionDirty
+                    ? 'border-amber-400/50 bg-amber-400/10 text-amber-200'
+                    : 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
+                }`}
+              >
+                {sessionDirty ? 'unsaved' : 'saved'}
+              </span>
+            </div>
+            <div className="flex min-w-0 items-center gap-1">
+              {tabs.map((tab) => {
+                const active = tab.id === activeTab?.id;
+                return renamingTabId === tab.id ? (
+                  <input
+                    key={tab.id}
+                    aria-label={`Rename ${tab.name}`}
+                    autoFocus
+                    className="h-8 w-28 rounded border border-sky-500 bg-slate-950 px-2 text-sm font-medium text-sky-100 outline-none"
+                    value={renamingTabName}
+                    onBlur={commitRenameTab}
+                    onChange={(event) => setRenamingTabName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') commitRenameTab();
+                      if (event.key === 'Escape') cancelRenameTab();
+                    }}
+                  />
+                ) : (
+                  <button
+                    key={tab.id}
+                    className={`h-8 whitespace-nowrap rounded border px-3 text-sm font-medium ${
+                      active
+                        ? 'border-sky-500 bg-sky-500/15 text-sky-100'
+                        : 'border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500'
+                    }`}
+                    type="button"
+                    onClick={() => {
+                      setActiveTabId(tab.id);
+                      setActivePlotId(tab.plots[0]?.id ?? null);
+                    }}
+                    onDoubleClick={() => beginRenameTab(tab)}
+                  >
+                    {tab.name}
+                  </button>
+                );
+              })}
+              <button
+                className="h-8 w-8 rounded border border-slate-700 bg-slate-950 text-sm font-semibold text-slate-300 hover:border-sky-500 hover:text-sky-100"
+                type="button"
+                onClick={addTab}
+              >
+                +
+              </button>
+            </div>
+
+            <div className="flex items-center gap-1 border-l border-slate-800 pl-2">
+              <button
+                className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-300 disabled:text-slate-600"
+                disabled={!canSplit}
+                type="button"
+                onClick={() => splitActivePlot('vertical')}
+              >
+                Split V
+              </button>
+              <button
+                className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-300 disabled:text-slate-600"
+                disabled={!canSplit}
+                type="button"
+                onClick={() => splitActivePlot('horizontal')}
+              >
+                Split H
+              </button>
+            </div>
+
+            <div className="flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs">
               <label className="sr-only" htmlFor="plot-filter">
                 Filter
               </label>
@@ -753,10 +1324,10 @@ export default function App() {
                 className="h-6 rounded bg-slate-950 text-slate-200 outline-none"
                 value={filter.kind}
                 onChange={(event) =>
-                  setFilter((current) => ({
-                    ...current,
+                  updateActiveFilter({
+                    ...filter,
                     kind: event.target.value as FilterKind,
-                  }))
+                  })
                 }
               >
                 <option value="none">No filter</option>
@@ -775,13 +1346,11 @@ export default function App() {
                     min={0.1}
                     step={1}
                     type="number"
-                    value={filter.cutoffHz}
-                    onChange={(event) =>
-                      setFilter((current) => ({
-                        ...current,
-                        cutoffHz: Number(event.target.value),
-                      }))
-                    }
+                    value={cutoffDraft}
+                    onChange={(event) => setCutoffDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') commitCutoffDraft();
+                    }}
                   />
                   <span className="text-slate-500">Hz</span>
                   <label className="sr-only" htmlFor="filter-order">
@@ -793,10 +1362,10 @@ export default function App() {
                     className="h-6 rounded bg-slate-950 font-mono text-slate-200 outline-none"
                     value={filter.order}
                     onChange={(event) =>
-                      setFilter((current) => ({
-                        ...current,
+                      updateActiveFilter({
+                        ...filter,
                         order: Number(event.target.value) as 2 | 4,
-                      }))
+                      })
                     }
                   >
                     <option value={2}>2p</option>
@@ -816,32 +1385,67 @@ export default function App() {
                     min={1}
                     step={1}
                     type="number"
-                    value={filter.windowSamples}
-                    onChange={(event) =>
-                      setFilter((current) => ({
-                        ...current,
-                        windowSamples: Number(event.target.value),
-                      }))
-                    }
+                    value={windowDraft}
+                    onChange={(event) => setWindowDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') commitWindowDraft();
+                    }}
                   />
                   <span className="text-slate-500">pts</span>
                 </>
               ) : null}
             </div>
-            <div className="ml-auto font-mono text-xs text-slate-400">
-              {signalData.length > 0
-                ? `${plotResolution} · ${formatCount(totalDisplayedPoints)} / ${formatCount(totalFullPoints)} points`
-                : datasetState === 'loading' || plotState === 'loading'
+
+            <div className="flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs">
+              <label className="text-slate-500" htmlFor="max-points">
+                points/trace
+              </label>
+              <input
+                id="max-points"
+                aria-label="Fast points per trace"
+                className="h-6 w-20 rounded border border-slate-800 bg-slate-950 px-1 font-mono text-slate-200 outline-none focus:border-sky-500"
+                min={500}
+                step={500}
+                type="number"
+                value={maxPointsDraft}
+                onChange={(event) => setMaxPointsDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') commitMaxPointsDraft();
+                }}
+              />
+            </div>
+
+            <div className="ml-auto whitespace-nowrap font-mono text-xs text-slate-400">
+              {activeSummary
+                ? activeSummary.state === 'loading'
+                  ? 'loading'
+                  : `${activePlot?.resolution ?? 'fast'} · ${formatCount(
+                      activeSummary.displayedPoints,
+                    )} / ${formatCount(activeSummary.fullPoints)} points`
+                : datasetState === 'loading'
                   ? 'loading'
                   : 'idle'}
             </div>
           </div>
 
           <div className="relative min-h-0 flex-1 bg-slate-950 p-3">
-            <div
-              ref={plotRef}
-              className="h-full min-h-[420px] w-full border border-slate-800 bg-slate-900"
-            />
+            {activeTab ? (
+              <div className={`grid h-full min-h-0 gap-2 ${layoutClass(activeTab.layout)}`}>
+                {activeTab.plots.map((plot) => (
+                  <PlotCell
+                    key={plot.id}
+                    active={plot.id === activePlot?.id}
+                    canRemove={activeTab.plots.length > 1}
+                    datasetId={selectedDatasetId}
+                    plot={plot}
+                    onSelect={() => setActivePlotId(plot.id)}
+                    onSplit={(direction) => splitPlot(plot.id, direction)}
+                    onRemove={() => removePlot(plot.id)}
+                    onSummary={handlePlotSummary}
+                  />
+                ))}
+              </div>
+            ) : null}
 
             {error ? (
               <div className="absolute left-6 top-6 rounded border border-rose-500/60 bg-rose-950 px-3 py-2 text-sm text-rose-100">

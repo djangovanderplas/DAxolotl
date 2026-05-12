@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import App from './App';
 
 const plotlyReactMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -126,6 +126,8 @@ type PlotlyTraceCall = [
   },
 ];
 
+type RelayoutHandler = (event: Record<string, unknown>) => void;
+
 function lastPlotlyCall(): PlotlyTraceCall {
   const call = plotlyReactMock.mock.calls.at(-1);
   expect(call).toBeDefined();
@@ -138,6 +140,15 @@ function clickCheckboxForText(text: string) {
   const checkbox = label!.querySelector('input[type="checkbox"]');
   expect(checkbox).not.toBeNull();
   fireEvent.click(checkbox!);
+}
+
+async function plotSelectedSignals(...names: string[]) {
+  await screen.findByText(names[0]);
+  for (const name of names) {
+    clickCheckboxForText(name);
+  }
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+  await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
 }
 
 function jsonResponse(body: unknown, status = 200) {
@@ -169,19 +180,23 @@ function mockFetchForHappyPath() {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
 
 describe('App', () => {
-  it('loads datasets, selects Chamber Eth by default, and renders Plotly data', async () => {
+  it('loads datasets with no default channels and renders selected Plotly data', async () => {
     const fetchMock = mockFetchForHappyPath();
 
     render(<App />);
 
     expect(await screen.findByText('HF16')).toBeInTheDocument();
     expect(screen.getByText('1,157,937')).toBeInTheDocument();
+    expect(screen.getAllByText('0 selected').length).toBeGreaterThan(0);
+    expect(plotlyReactMock).not.toHaveBeenCalled();
 
+    await plotSelectedSignals('Chamber Eth');
     await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
     expect(fetchMock).toHaveBeenCalledWith('/api/datasets');
     expect(fetchMock).toHaveBeenCalledWith('/api/datasets/1');
@@ -206,11 +221,8 @@ describe('App', () => {
     const fetchMock = mockFetchForHappyPath();
 
     render(<App />);
-    await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
 
-    await screen.findByText('Thrust');
-    clickCheckboxForText('Thrust');
-    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await plotSelectedSignals('Chamber Eth', 'Thrust');
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -225,12 +237,110 @@ describe('App', () => {
     });
   });
 
+  it('adds tabs and splits the active tab into independently configurable plots', async () => {
+    const fetchMock = mockFetchForHappyPath();
+
+    render(<App />);
+    await screen.findByText('HF16');
+
+    fireEvent.click(screen.getByRole('button', { name: '+' }));
+    expect(await screen.findByRole('button', { name: 'Tab 2' })).toBeInTheDocument();
+    expect(screen.getByText('Tab 2 / Plot 2')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Split V' }));
+    expect(await screen.findByRole('button', { name: 'Plot 3' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Plot 3' }));
+    clickCheckboxForText('Chamber Eth');
+    clickCheckboxForText('Thrust');
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/api/datasets/1/channels/78/data?'),
+        expect.any(Object),
+      ),
+    );
+    expect(screen.getByText('Tab 2 / Plot 3')).toBeInTheDocument();
+  });
+
+  it('renames tabs on double click', async () => {
+    mockFetchForHappyPath();
+
+    render(<App />);
+    await screen.findByText('HF16');
+
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'Tab 1' }));
+    const renameInput = screen.getByRole('textbox', { name: 'Rename Tab 1' });
+    fireEvent.change(renameInput, { target: { value: 'Ignition' } });
+    fireEvent.keyDown(renameInput, { key: 'Enter' });
+
+    expect(await screen.findByRole('button', { name: 'Ignition' })).toBeInTheDocument();
+    expect(screen.getByText('Ignition / Plot 1')).toBeInTheDocument();
+  });
+
+  it('splits and removes plots from the plot context menu', async () => {
+    mockFetchForHappyPath();
+
+    render(<App />);
+    await screen.findByText('HF16');
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Plot 1' }), {
+      clientX: 100,
+      clientY: 100,
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Split vertical' }));
+    expect(await screen.findByRole('button', { name: 'Plot 2' })).toBeInTheDocument();
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Plot 2' }), {
+      clientX: 100,
+      clientY: 100,
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove plot' }));
+    expect(screen.queryByRole('button', { name: 'Plot 2' })).not.toBeInTheDocument();
+  });
+
+  it('saves, opens, and restores local browser sessions', async () => {
+    mockFetchForHappyPath();
+    vi.stubGlobal(
+      'confirm',
+      vi.fn(() => true),
+    );
+
+    render(<App />);
+    await screen.findByText('HF16');
+
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'Tab 1' }));
+    const renameInput = screen.getByRole('textbox', { name: 'Rename Tab 1' });
+    fireEvent.change(renameInput, { target: { value: 'Saved run' } });
+    fireEvent.keyDown(renameInput, { key: 'Enter' });
+    expect(await screen.findByRole('button', { name: 'Saved run' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(screen.getByText('saved')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '+' }));
+    expect(screen.getByRole('button', { name: 'Tab 2' })).toBeInTheDocument();
+    expect(screen.getByText('unsaved')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'New' }));
+    expect(await screen.findByRole('button', { name: 'Tab 1' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Saved run' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+    expect(await screen.findByRole('button', { name: 'Saved run' })).toBeInTheDocument();
+
+    cleanup();
+    render(<App />);
+    expect(await screen.findByRole('button', { name: 'Saved run' })).toBeInTheDocument();
+  });
+
   it('can request full-resolution channel data', async () => {
     const fetchMock = mockFetchForHappyPath();
 
     render(<App />);
-    await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
 
+    await screen.findByText('Chamber Eth');
+    clickCheckboxForText('Chamber Eth');
     fireEvent.click(screen.getByRole('button', { name: 'Full' }));
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 
@@ -253,7 +363,7 @@ describe('App', () => {
     await waitFor(() => {
       const [, traces] = lastPlotlyCall();
       expect(traces[0].x).toEqual(fullChamberData.t);
-      expect(screen.getByText('full · 5 / 5 points')).toBeInTheDocument();
+      expect(screen.getAllByText('full · 5 / 5 points').length).toBeGreaterThan(0);
     });
   });
 
@@ -261,14 +371,20 @@ describe('App', () => {
     const fetchMock = mockFetchForHappyPath();
 
     render(<App />);
-    await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
+    await plotSelectedSignals('Chamber Eth');
 
     fireEvent.change(screen.getByRole('combobox', { name: 'Filter' }), {
       target: { value: 'moving-average' },
     });
-    fireEvent.change(screen.getByRole('spinbutton', { name: 'Window samples' }), {
+    const windowInput = screen.getByRole('spinbutton', { name: 'Window samples' });
+    fireEvent.change(windowInput, {
       target: { value: '3' },
     });
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('window_samples=3'),
+      expect.any(Object),
+    );
+    fireEvent.keyDown(windowInput, { key: 'Enter' });
 
     await waitFor(() => {
       const [, traces, layout] = lastPlotlyCall();
@@ -285,16 +401,83 @@ describe('App', () => {
     );
   });
 
+  it('lets fast mode request a custom point budget per trace', async () => {
+    const fetchMock = mockFetchForHappyPath();
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth');
+    fetchMock.mockClear();
+
+    const pointsInput = screen.getByRole('spinbutton', { name: 'Fast points per trace' });
+    fireEvent.change(pointsInput, {
+      target: { value: '9000' },
+    });
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('max_points=9000'),
+      expect.any(Object),
+    );
+    fireEvent.keyDown(pointsInput, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('max_points=9000'),
+        expect.any(Object),
+      ),
+    );
+  });
+
+  it('refetches the visible time window after Plotly relayout', async () => {
+    const fetchMock = mockFetchForHappyPath();
+    const handlers = new Map<string, RelayoutHandler>();
+    const prototype = HTMLElement.prototype as HTMLElement & {
+      on?: (eventName: string, handler: RelayoutHandler) => void;
+      removeListener?: (eventName: string) => void;
+    };
+    const originalOn = prototype.on;
+    const originalRemoveListener = prototype.removeListener;
+    prototype.on = vi.fn((eventName: string, handler: RelayoutHandler) => {
+      handlers.set(eventName, handler);
+    });
+    prototype.removeListener = vi.fn((eventName: string) => {
+      handlers.delete(eventName);
+    });
+
+    try {
+      render(<App />);
+      await plotSelectedSignals('Chamber Eth');
+      await waitFor(() => expect(handlers.has('plotly_relayout')).toBe(true));
+
+      await act(async () => {
+        handlers.get('plotly_relayout')?.({
+          'xaxis.range[0]': 0.5,
+          'xaxis.range[1]': 1.5,
+        });
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, 250);
+        });
+      });
+
+      await waitFor(
+        () =>
+          expect(fetchMock).toHaveBeenCalledWith(
+            expect.stringContaining('t_min=0.5&t_max=1.5'),
+            expect.any(Object),
+          ),
+        { timeout: 1000 },
+      );
+    } finally {
+      prototype.on = originalOn;
+      prototype.removeListener = originalRemoveListener;
+    }
+  });
+
   it('applies selected valve overlays as Plotly shapes and annotations', async () => {
     const fetchMock = mockFetchForHappyPath();
 
     render(<App />);
-    await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Filter' }), {
-      target: { value: 'moving-average' },
-    });
     await screen.findByText('O-MV');
+    clickCheckboxForText('Chamber Eth');
     clickCheckboxForText('O-MV');
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 

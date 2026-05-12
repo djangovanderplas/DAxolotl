@@ -29,7 +29,9 @@ Open <http://localhost:5173>. The frontend proxies `/api/*` to the backend.
 ## Test / lint
 
 ```bash
-make test             # pytest backend/tests
+make test             # backend pytest + frontend vitest
+make test-backend     # pytest backend/tests
+make test-frontend    # cd frontend && npm test
 make lint             # ruff + prettier
 make format           # auto-fix
 ```

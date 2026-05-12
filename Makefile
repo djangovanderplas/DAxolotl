@@ -1,4 +1,7 @@
-.PHONY: install backend frontend dev lint format test clean
+CONDA_ENV ?= DAxolotl
+PYTHON ?= conda run -n $(CONDA_ENV) python
+
+.PHONY: install backend frontend dev lint format test test-backend test-frontend clean
 
 install:
 	pip install -e ".[dev]"
@@ -27,8 +30,13 @@ format:
 	ruff format backend
 	cd frontend && npm run format
 
-test:
-	pytest
+test: test-backend test-frontend
+
+test-backend:
+	$(PYTHON) -m pytest
+
+test-frontend:
+	cd frontend && npm test
 
 clean:
 	rm -rf .pytest_cache .ruff_cache .mypy_cache
