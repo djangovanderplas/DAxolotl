@@ -584,6 +584,66 @@ describe('App', () => {
     });
   });
 
+  it('adds multiple polynomial regression overlays and copies coefficients', async () => {
+    mockFetchForHappyPath();
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      clipboard: { writeText },
+    });
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth', 'Thrust');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analysis Tools' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getAllByText('Regression').length).toBeGreaterThan(0);
+    expect(within(dialog).getByRole('combobox', { name: 'Regression channel' })).toHaveValue(
+      '1:68',
+    );
+    fireEvent.change(within(dialog).getByRole('spinbutton', { name: 'Polynomial order' }), {
+      target: { value: '1' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Copy coefficients' }));
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(expect.stringContaining('coefficients_dt_ascending'));
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add regression' }));
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Regression channel' }), {
+      target: { value: '1:78' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add regression' }));
+
+    await waitFor(() => {
+      const [, traces] = lastPlotlyCall();
+      expect(traces.map((trace) => trace.name)).toContain('Chamber Eth regression');
+      expect(traces.map((trace) => trace.name)).toContain('Thrust regression');
+    });
+  });
+
+  it('calculates and copies area from analysis tools', async () => {
+    mockFetchForHappyPath();
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      clipboard: { writeText },
+    });
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analysis Tools' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Area' }));
+    expect(within(dialog).getByRole('combobox', { name: 'Area channel' })).toHaveValue('1:68');
+    expect(within(dialog).getByText('Average')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Copy area' }));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(expect.stringContaining('area='));
+    });
+  });
+
   it('applies selected valve overlays as Plotly shapes and annotations', async () => {
     const fetchMock = mockFetchForHappyPath();
 

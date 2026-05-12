@@ -42,6 +42,8 @@ type PlotResolution = 'fast' | 'full';
 type FilterKind = 'none' | 'butterworth' | 'moving-average';
 type CursorId = 'A' | 'B';
 type CursorSnapMode = 'interpolate' | 'sample';
+type AnalysisTool = 'polyfit' | 'area';
+type AnalysisIntervalMode = 'cursors' | 'viewport' | 'manual';
 
 type FilterConfig = {
   kind: FilterKind;
@@ -81,6 +83,13 @@ type ChannelRef = {
   channelId: number;
 };
 
+type RegressionConfig = {
+  id: string;
+  channelRef: ChannelRef;
+  degree: number;
+  interval: TimeWindow;
+};
+
 type PlotConfig = {
   id: string;
   name: string;
@@ -95,6 +104,7 @@ type PlotConfig = {
   cursorSnap: CursorSnapMode;
   cursorPanelCollapsed: boolean;
   cursorPanelPosition: { x: number; y: number } | null;
+  regressions: RegressionConfig[];
 };
 
 type PlotTab = {
@@ -109,6 +119,11 @@ type PlotSummary = {
   displayedPoints: number;
   fullPoints: number;
   error: string | null;
+};
+
+type PlotAnalysisData = {
+  signals: ChannelData[];
+  visibleWindow: TimeWindow | null;
 };
 
 type VisibleSignalTrace = {
@@ -445,6 +460,95 @@ function traceVisible(plotElement: PlotElement | null, index: number): boolean {
   return visible !== false && visible !== 'legendonly';
 }
 
+function formatAnalysisValue(value: number | null | undefined, digits = 4): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value === 0) return '0';
+  if (Math.abs(value) >= 1e4 || Math.abs(value) < 1e-3) return value.toExponential(3);
+  return Number(value).toPrecision(digits);
+}
+
+function dataInWindow(
+  data: ChannelData,
+  interval: TimeWindow | null,
+): { t: number[]; y: number[] } {
+  if (!interval) return { t: data.t, y: data.y };
+  const t: number[] = [];
+  const y: number[] = [];
+  const tMin = Math.min(interval.tMin, interval.tMax);
+  const tMax = Math.max(interval.tMin, interval.tMax);
+  for (let i = 0; i < data.t.length; i += 1) {
+    const value = data.t[i];
+    if (value >= tMin && value <= tMax) {
+      t.push(value);
+      y.push(data.y[i]);
+    }
+  }
+  return { t, y };
+}
+
+function trapezoidArea(t: number[], y: number[]): number | null {
+  if (t.length < 2 || y.length < 2) return null;
+  let area = 0;
+  for (let i = 1; i < t.length; i += 1) {
+    area += ((y[i - 1] + y[i]) / 2) * (t[i] - t[i - 1]);
+  }
+  return area;
+}
+
+function solveLinearSystem(matrix: number[][], vector: number[]): number[] | null {
+  const n = vector.length;
+  const augmented = matrix.map((row, index) => [...row, vector[index]]);
+  for (let pivot = 0; pivot < n; pivot += 1) {
+    let maxRow = pivot;
+    for (let row = pivot + 1; row < n; row += 1) {
+      if (Math.abs(augmented[row][pivot]) > Math.abs(augmented[maxRow][pivot])) maxRow = row;
+    }
+    if (Math.abs(augmented[maxRow][pivot]) < 1e-12) return null;
+    [augmented[pivot], augmented[maxRow]] = [augmented[maxRow], augmented[pivot]];
+    const pivotValue = augmented[pivot][pivot];
+    for (let col = pivot; col <= n; col += 1) augmented[pivot][col] /= pivotValue;
+    for (let row = 0; row < n; row += 1) {
+      if (row === pivot) continue;
+      const factor = augmented[row][pivot];
+      for (let col = pivot; col <= n; col += 1)
+        augmented[row][col] -= factor * augmented[pivot][col];
+    }
+  }
+  return augmented.map((row) => row[n]);
+}
+
+function polynomialFit(t: number[], y: number[], degree: number): number[] | null {
+  if (t.length === 0 || y.length === 0) return null;
+  const fitDegree = Math.max(1, Math.min(5, Math.round(degree)));
+  if (t.length < fitDegree + 1) return null;
+  const t0 = t[0];
+  const x = t.map((value) => value - t0);
+  const size = fitDegree + 1;
+  const matrix = Array.from({ length: size }, (_, row) =>
+    Array.from({ length: size }, (_, col) =>
+      x.reduce((total, value) => total + value ** (row + col), 0),
+    ),
+  );
+  const vector = Array.from({ length: size }, (_, row) =>
+    x.reduce((total, value, index) => total + y[index] * value ** row, 0),
+  );
+  return solveLinearSystem(matrix, vector);
+}
+
+function evaluatePolynomial(coefficients: number[], dt: number): number {
+  return coefficients.reduce((total, coefficient, index) => total + coefficient * dt ** index, 0);
+}
+
+function formatPolynomial(coefficients: number[]): string {
+  return coefficients
+    .map((coefficient, index) =>
+      index === 0
+        ? formatAnalysisValue(coefficient)
+        : `${formatAnalysisValue(coefficient)}·dt${index > 1 ? `^${index}` : ''}`,
+    )
+    .join(' + ');
+}
+
 function defaultPlot(id: string, name: string): PlotConfig {
   return {
     id,
@@ -460,6 +564,7 @@ function defaultPlot(id: string, name: string): PlotConfig {
     cursorSnap: 'interpolate',
     cursorPanelCollapsed: false,
     cursorPanelPosition: null,
+    regressions: [],
   };
 }
 
@@ -534,6 +639,42 @@ function normalizeRefs(value: unknown, datasetIds: Set<number>): ChannelRef[] {
     .filter((item): item is ChannelRef => item !== null);
 }
 
+function normalizeTimeWindow(value: unknown): TimeWindow | null {
+  if (!value || typeof value !== 'object') return null;
+  const tMin = Number((value as TimeWindow).tMin);
+  const tMax = Number((value as TimeWindow).tMax);
+  if (!Number.isFinite(tMin) || !Number.isFinite(tMax) || tMin === tMax) return null;
+  return { tMin: Math.min(tMin, tMax), tMax: Math.max(tMin, tMax) };
+}
+
+function normalizePolynomialDegree(value: unknown): number {
+  return Math.max(1, Math.min(5, Math.round(Number(value ?? 1))));
+}
+
+function normalizeRegressionList(value: unknown, datasetIds: Set<number>): RegressionConfig[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item, index) => {
+      if (!item || typeof item !== 'object') return null;
+      const channelRef = normalizeRefs(
+        [(item as Partial<RegressionConfig>).channelRef],
+        datasetIds,
+      )[0];
+      const interval = normalizeTimeWindow((item as Partial<RegressionConfig>).interval);
+      if (!channelRef || !interval) return null;
+      return {
+        id:
+          typeof (item as Partial<RegressionConfig>).id === 'string'
+            ? ((item as Partial<RegressionConfig>).id as string)
+            : `regression-${index + 1}`,
+        channelRef,
+        degree: normalizePolynomialDegree((item as Partial<RegressionConfig>).degree),
+        interval,
+      };
+    })
+    .filter((item): item is RegressionConfig => item !== null);
+}
+
 function normalizePlot(
   value: unknown,
   fallbackDatasetId: number | null,
@@ -543,6 +684,8 @@ function normalizePlot(
   const raw = value as Partial<PlotConfig> & {
     signalIds?: unknown;
     valveIds?: unknown;
+    regression?: unknown;
+    regressions?: unknown;
   };
   if (typeof raw.id !== 'string' || typeof raw.name !== 'string') return null;
 
@@ -561,6 +704,23 @@ function normalizePlot(
       ? raw.valveIds
           .filter((channelId): channelId is number => typeof channelId === 'number')
           .map((channelId) => ({ datasetId: legacyDatasetId, channelId }))
+      : [];
+  const savedRegressions = normalizeRegressionList(raw.regressions, datasetIds);
+  const legacyRegression =
+    raw.regression &&
+    typeof raw.regression === 'object' &&
+    (raw.regression as { enabled?: unknown }).enabled === true
+      ? normalizeRegressionList(
+          [
+            {
+              id: 'legacy-regression',
+              channelRef: (raw.regression as { channelRef?: unknown }).channelRef,
+              degree: (raw.regression as { degree?: unknown }).degree,
+              interval: (raw.regression as { interval?: unknown }).interval,
+            },
+          ],
+          datasetIds,
+        )
       : [];
 
   return {
@@ -600,6 +760,7 @@ function normalizePlot(
             y: Number(raw.cursorPanelPosition.y),
           }
         : null,
+    regressions: [...savedRegressions, ...legacyRegression],
   };
 }
 
@@ -653,6 +814,7 @@ function PlotCell({
   onSplit,
   onRemove,
   onUpdate,
+  onAnalysisData,
   onSummary,
 }: {
   datasets: DatasetSummary[];
@@ -664,6 +826,7 @@ function PlotCell({
   onSplit: (direction: 'horizontal' | 'vertical') => void;
   onRemove: () => void;
   onUpdate: (updater: (plot: PlotConfig) => PlotConfig) => void;
+  onAnalysisData: (plotId: string, data: PlotAnalysisData) => void;
   onSummary: (plotId: string, summary: PlotSummary) => void;
 }) {
   const plotRef = useRef<HTMLDivElement | null>(null);
@@ -903,6 +1066,13 @@ function PlotCell({
   }, [error, onSummary, plot.id, plotState, totalDisplayedPoints, totalFullPoints]);
 
   useEffect(() => {
+    onAnalysisData(plot.id, {
+      signals: visibleSignalTraces.map(({ data }) => data),
+      visibleWindow,
+    });
+  }, [onAnalysisData, plot.id, visibleSignalTraces, visibleWindow]);
+
+  useEffect(() => {
     const plotElement = plotRef.current;
     if (!plotElement) return;
     if (signalData.length === 0) {
@@ -926,18 +1096,49 @@ function PlotCell({
         : plot.filter.kind === 'butterworth'
           ? ` · Butterworth ${plot.filter.cutoffHz} Hz`
           : ` · Avg ${plot.filter.windowSamples} samples`;
+    const regressionColors = ['#f8fafc', '#facc15', '#c084fc', '#34d399', '#fb7185'];
+    const regressionTraces = plot.regressions.flatMap((regression, index) => {
+      const source = signalData.find(
+        (data) =>
+          refKey({ datasetId: data.dataset_id, channelId: data.channel_id }) ===
+          refKey(regression.channelRef),
+      );
+      if (!source) return [];
+      const window = dataInWindow(source, regression.interval);
+      const coefficients = polynomialFit(window.t, window.y, regression.degree);
+      if (!coefficients || window.t.length === 0) return [];
+      const t0 = window.t[0];
+      return [
+        {
+          x: window.t,
+          y: window.t.map((time) => evaluatePolynomial(coefficients, time - t0)),
+          type: 'scattergl' as const,
+          mode: 'lines' as const,
+          name: `${nameForTrace(source)} regression`,
+          line: {
+            color: regressionColors[index % regressionColors.length],
+            width: 2.4,
+            dash: 'dash',
+          },
+          hovertemplate: 't=%{x:.4f}s<br>%{y:.4f}<extra>%{fullData.name}</extra>',
+        },
+      ];
+    });
 
     void Plotly.react(
       plotElement,
-      signalData.map((data, index) => ({
-        x: data.t,
-        y: data.y,
-        type: 'scattergl',
-        mode: 'lines',
-        name: nameForTrace(data),
-        line: { color: TRACE_COLORS[index % TRACE_COLORS.length], width: 1.6 },
-        hovertemplate: 't=%{x:.4f}s<br>%{y:.4f}<extra>%{fullData.name}</extra>',
-      })),
+      [
+        ...signalData.map((data, index) => ({
+          x: data.t,
+          y: data.y,
+          type: 'scattergl' as const,
+          mode: 'lines' as const,
+          name: nameForTrace(data),
+          line: { color: TRACE_COLORS[index % TRACE_COLORS.length], width: 1.6 },
+          hovertemplate: 't=%{x:.4f}s<br>%{y:.4f}<extra>%{fullData.name}</extra>',
+        })),
+        ...regressionTraces,
+      ],
       {
         autosize: true,
         paper_bgcolor: '#020617',
@@ -1668,6 +1869,494 @@ function PlotDataDialog({
   );
 }
 
+function AnalysisToolsDialog({
+  datasets,
+  plot,
+  analysisData,
+  onAddRegression,
+  onRemoveRegression,
+  onClose,
+}: {
+  datasets: DatasetSummary[];
+  plot: PlotConfig;
+  analysisData: PlotAnalysisData | null;
+  onAddRegression: (regression: RegressionConfig) => void;
+  onRemoveRegression: (id: string) => void;
+  onClose: () => void;
+}) {
+  const cursorWindow = cursorInterval(plot);
+  const viewportWindow = analysisData?.visibleWindow ?? timeRange(analysisData?.signals ?? []);
+  const [tool, setTool] = useState<AnalysisTool>('polyfit');
+  const [intervalMode, setIntervalMode] = useState<AnalysisIntervalMode>(
+    cursorWindow ? 'cursors' : 'viewport',
+  );
+  const [manualMinDraft, setManualMinDraft] = useState('');
+  const [manualMaxDraft, setManualMaxDraft] = useState('');
+  const [polyfitDegree, setPolyfitDegree] = useState(1);
+  const [selectedChannelKey, setSelectedChannelKey] = useState('');
+  const [copyStatus, setCopyStatus] = useState('');
+
+  useEffect(() => {
+    const fallback = cursorWindow ?? viewportWindow;
+    setManualMinDraft(fallback ? String(fallback.tMin) : '');
+    setManualMaxDraft(fallback ? String(fallback.tMax) : '');
+  }, [cursorWindow?.tMax, cursorWindow?.tMin, viewportWindow?.tMax, viewportWindow?.tMin]);
+
+  const manualWindow = useMemo(() => {
+    const tMin = Number(manualMinDraft);
+    const tMax = Number(manualMaxDraft);
+    if (!Number.isFinite(tMin) || !Number.isFinite(tMax) || tMin === tMax) return null;
+    return { tMin: Math.min(tMin, tMax), tMax: Math.max(tMin, tMax) };
+  }, [manualMaxDraft, manualMinDraft]);
+  const interval =
+    intervalMode === 'cursors'
+      ? cursorWindow
+      : intervalMode === 'manual'
+        ? manualWindow
+        : viewportWindow;
+  const signals = analysisData?.signals ?? [];
+  useEffect(() => {
+    if (selectedChannelKey || signals.length === 0) return;
+    setSelectedChannelKey(
+      refKey({ datasetId: signals[0].dataset_id, channelId: signals[0].channel_id }),
+    );
+  }, [selectedChannelKey, signals]);
+  const plottedDatasetIds = new Set(signals.map((data) => data.dataset_id));
+  const traceName = (data: ChannelData) => {
+    const datasetName = findDataset(datasets, data.dataset_id)?.name;
+    return plottedDatasetIds.size > 1 && datasetName
+      ? `${datasetName} / ${data.channel_name}`
+      : data.channel_name;
+  };
+  const windowed = signals.map((data) => ({
+    data,
+    name: traceName(data),
+    unit: data.unit,
+    window: dataInWindow(data, interval),
+  }));
+  const hasSamples = windowed.some((item) => item.window.y.length > 0);
+  const selectedSignal = signals.find(
+    (data) =>
+      refKey({ datasetId: data.dataset_id, channelId: data.channel_id }) === selectedChannelKey,
+  );
+  const selectedWindow = selectedSignal ? dataInWindow(selectedSignal, interval) : { t: [], y: [] };
+  const selectedCoefficients = polynomialFit(selectedWindow.t, selectedWindow.y, polyfitDegree);
+  const selectedChannelRef = selectedSignal
+    ? { datasetId: selectedSignal.dataset_id, channelId: selectedSignal.channel_id }
+    : null;
+  const area = trapezoidArea(selectedWindow.t, selectedWindow.y);
+  const duration =
+    selectedWindow.t.length > 1
+      ? selectedWindow.t[selectedWindow.t.length - 1] - selectedWindow.t[0]
+      : null;
+  const average = area !== null && duration && duration !== 0 ? area / duration : null;
+
+  const copyText = async (text: string) => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(text);
+      setCopyStatus('Copied');
+    } catch {
+      setCopyStatus('Copy failed');
+    }
+  };
+
+  const copyCoefficients = () => {
+    if (!selectedSignal || !selectedCoefficients || selectedWindow.t.length === 0) return;
+    const t0 = selectedWindow.t[0];
+    void copyText(
+      [
+        `channel=${traceName(selectedSignal)}`,
+        `order=${normalizePolynomialDegree(polyfitDegree)}`,
+        `t0_s=${t0.toPrecision(17)}`,
+        `coefficients_dt_ascending=${selectedCoefficients
+          .map((coefficient) => coefficient.toPrecision(17))
+          .join(', ')}`,
+      ].join('\n'),
+    );
+  };
+
+  const copyArea = () => {
+    if (!selectedSignal || area === null) return;
+    void copyText(
+      [
+        `channel=${traceName(selectedSignal)}`,
+        `t_min_s=${selectedWindow.t[0]?.toPrecision(17) ?? ''}`,
+        `t_max_s=${selectedWindow.t[selectedWindow.t.length - 1]?.toPrecision(17) ?? ''}`,
+        `area=${area.toPrecision(17)}${selectedSignal.unit ? ` ${selectedSignal.unit}*s` : ''}`,
+      ].join('\n'),
+    );
+  };
+
+  const applyRegression = () => {
+    if (!selectedChannelRef || !interval || !selectedCoefficients) return;
+    onAddRegression({
+      id: `regression-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      channelRef: selectedChannelRef,
+      degree: normalizePolynomialDegree(polyfitDegree),
+      interval,
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4">
+      <div
+        aria-modal="true"
+        className="flex max-h-[88vh] w-full max-w-6xl flex-col rounded border border-slate-700 bg-slate-900 shadow-2xl shadow-slate-950"
+        role="dialog"
+      >
+        <div className="flex shrink-0 items-center gap-3 border-b border-slate-800 px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold text-slate-100">Analysis Tools</div>
+            <div className="mt-0.5 text-xs text-slate-500">
+              {plot.name} · {signals.length} visible {signals.length === 1 ? 'trace' : 'traces'}
+            </div>
+          </div>
+          <button
+            className="ml-auto h-8 rounded border border-slate-700 bg-slate-950 px-3 text-sm text-slate-300 hover:border-slate-500"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+          <button
+            className="h-8 rounded border border-sky-500 bg-sky-500/15 px-3 text-sm font-medium text-sky-100 hover:bg-sky-500/25 disabled:border-slate-700 disabled:bg-slate-950 disabled:text-slate-600"
+            disabled={
+              tool !== 'polyfit' || !selectedChannelRef || !interval || !selectedCoefficients
+            }
+            type="button"
+            onClick={applyRegression}
+          >
+            Add regression
+          </button>
+        </div>
+
+        <div className="grid min-h-0 flex-1 grid-cols-[15rem_minmax(0,1fr)] overflow-hidden">
+          <aside className="border-r border-slate-800 p-3">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Tool
+            </div>
+            <div className="space-y-1">
+              {[
+                ['polyfit', 'Regression'],
+                ['area', 'Area'],
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  className={`block h-9 w-full rounded border px-3 text-left text-sm ${
+                    tool === value
+                      ? 'border-sky-500 bg-sky-500/15 text-sky-100'
+                      : 'border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-600'
+                  }`}
+                  type="button"
+                  onClick={() => setTool(value as AnalysisTool)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-5 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Interval
+            </div>
+            <div className="mt-2 space-y-1">
+              <label className="flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs text-slate-300">
+                <input
+                  checked={intervalMode === 'cursors'}
+                  className="accent-sky-500"
+                  disabled={!cursorWindow}
+                  type="radio"
+                  onChange={() => setIntervalMode('cursors')}
+                />
+                cursors
+              </label>
+              <label className="flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs text-slate-300">
+                <input
+                  checked={intervalMode === 'viewport'}
+                  className="accent-sky-500"
+                  type="radio"
+                  onChange={() => setIntervalMode('viewport')}
+                />
+                viewport
+              </label>
+              <label className="flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs text-slate-300">
+                <input
+                  checked={intervalMode === 'manual'}
+                  className="accent-sky-500"
+                  type="radio"
+                  onChange={() => setIntervalMode('manual')}
+                />
+                manual
+              </label>
+            </div>
+
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+              <label className="text-slate-500" htmlFor="analysis-t-min">
+                t_min
+                <input
+                  id="analysis-t-min"
+                  aria-label="Analysis t min"
+                  className="mt-1 h-8 w-full rounded border border-slate-800 bg-slate-950 px-2 font-mono text-slate-100 outline-none focus:border-sky-500 disabled:text-slate-600"
+                  disabled={intervalMode !== 'manual'}
+                  type="number"
+                  value={manualMinDraft}
+                  onChange={(event) => setManualMinDraft(event.target.value)}
+                />
+              </label>
+              <label className="text-slate-500" htmlFor="analysis-t-max">
+                t_max
+                <input
+                  id="analysis-t-max"
+                  aria-label="Analysis t max"
+                  className="mt-1 h-8 w-full rounded border border-slate-800 bg-slate-950 px-2 font-mono text-slate-100 outline-none focus:border-sky-500 disabled:text-slate-600"
+                  disabled={intervalMode !== 'manual'}
+                  type="number"
+                  value={manualMaxDraft}
+                  onChange={(event) => setManualMaxDraft(event.target.value)}
+                />
+              </label>
+            </div>
+
+            <div className="mt-4 rounded border border-slate-800 bg-slate-950 p-2 font-mono text-xs text-slate-400">
+              {interval
+                ? `${formatAnalysisValue(interval.tMin)}–${formatAnalysisValue(interval.tMax)} s`
+                : 'No interval'}
+            </div>
+          </aside>
+
+          <section className="min-h-0 overflow-y-auto p-4">
+            {!hasSamples ? (
+              <div className="rounded border border-slate-800 bg-slate-950 p-4 text-sm text-slate-400">
+                No visible samples are available for this plot and interval.
+              </div>
+            ) : null}
+
+            {tool === 'polyfit' && hasSamples ? (
+              <div>
+                <div className="mb-3 flex items-center gap-3">
+                  <div className="text-sm font-semibold text-slate-100">Regression</div>
+                </div>
+                <div className="mb-4 grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] gap-3 rounded border border-slate-800 bg-slate-950 p-3 text-sm">
+                  <label className="self-center text-slate-400" htmlFor="regression-type">
+                    Regression Type
+                  </label>
+                  <select
+                    id="regression-type"
+                    aria-label="Regression type"
+                    className="h-9 rounded border border-slate-700 bg-slate-900 px-2 text-slate-100 outline-none focus:border-sky-500"
+                    value="polynomial"
+                    onChange={() => undefined}
+                  >
+                    <option value="polynomial">Polynomial</option>
+                  </select>
+                  <label className="self-center text-slate-400" htmlFor="polyfit-degree">
+                    Order
+                  </label>
+                  <input
+                    id="polyfit-degree"
+                    aria-label="Polynomial order"
+                    className="h-9 rounded border border-slate-700 bg-slate-900 px-2 font-mono text-slate-100 outline-none focus:border-sky-500"
+                    min={1}
+                    max={5}
+                    type="number"
+                    value={polyfitDegree}
+                    onChange={(event) => setPolyfitDegree(Number(event.target.value))}
+                  />
+                  <label className="self-center text-slate-400" htmlFor="regression-channel">
+                    Line
+                  </label>
+                  <select
+                    id="regression-channel"
+                    aria-label="Regression channel"
+                    className="h-9 rounded border border-slate-700 bg-slate-900 px-2 text-slate-100 outline-none focus:border-sky-500"
+                    value={selectedChannelKey}
+                    onChange={(event) => setSelectedChannelKey(event.target.value)}
+                  >
+                    {signals.map((data) => (
+                      <option
+                        key={refKey({ datasetId: data.dataset_id, channelId: data.channel_id })}
+                        value={refKey({ datasetId: data.dataset_id, channelId: data.channel_id })}
+                      >
+                        {traceName(data)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mb-3 flex items-center gap-3">
+                  <div className="text-sm font-semibold text-slate-100">Preview</div>
+                  <label className="ml-auto text-xs text-slate-500" htmlFor="polyfit-degree">
+                    samples
+                  </label>
+                  <span className="font-mono text-xs text-slate-400">
+                    {selectedWindow.y.length}
+                  </span>
+                </div>
+                <div className="space-y-3">
+                  {selectedSignal ? (
+                    (() => {
+                      const name = traceName(selectedSignal);
+                      const unit = selectedSignal.unit;
+                      const coeffs = selectedCoefficients;
+                      return (
+                        <div className="rounded border border-slate-800 bg-slate-950 p-3">
+                          <div className="mb-2 text-sm font-medium text-slate-100">{name}</div>
+                          {coeffs ? (
+                            <div className="font-mono text-xs text-slate-300">
+                              y = {formatPolynomial(coeffs)}
+                              <span className="ml-2 text-slate-500">{unit ?? ''}</span>
+                              <div className="mt-1 text-slate-500">
+                                dt is seconds from {formatAnalysisValue(selectedWindow.t[0])} s
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="text-xs text-slate-500">
+                              Not enough samples for this polynomial order.
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()
+                  ) : (
+                    <div className="rounded border border-slate-800 bg-slate-950 p-3 text-sm text-slate-400">
+                      Select a channel to regress.
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="h-8 rounded border border-slate-700 bg-slate-950 px-3 text-sm text-slate-300 hover:border-slate-500 disabled:text-slate-600"
+                      disabled={!selectedCoefficients}
+                      type="button"
+                      onClick={copyCoefficients}
+                    >
+                      Copy coefficients
+                    </button>
+                    {copyStatus ? (
+                      <span className="text-xs text-slate-500">{copyStatus}</span>
+                    ) : null}
+                  </div>
+                  {plot.regressions.length > 0 ? (
+                    <div className="rounded border border-slate-800 bg-slate-950 p-3">
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        Active Regressions
+                      </div>
+                      <div className="space-y-2">
+                        {plot.regressions.map((regression) => {
+                          const signal = signals.find(
+                            (data) =>
+                              refKey({ datasetId: data.dataset_id, channelId: data.channel_id }) ===
+                              refKey(regression.channelRef),
+                          );
+                          return (
+                            <div
+                              key={regression.id}
+                              className="flex items-center gap-3 rounded border border-slate-800 bg-slate-900 px-3 py-2 text-xs"
+                            >
+                              <span className="min-w-0 flex-1 truncate text-slate-200">
+                                {signal ? traceName(signal) : refKey(regression.channelRef)}
+                              </span>
+                              <span className="font-mono text-slate-500">
+                                order {regression.degree}
+                              </span>
+                              <button
+                                className="rounded border border-slate-700 px-2 py-1 text-slate-300 hover:border-rose-500 hover:text-rose-100"
+                                type="button"
+                                onClick={() => onRemoveRegression(regression.id)}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
+                  {plot.regressions.length > 0 ? (
+                    <button
+                      className="h-8 rounded border border-rose-500/60 bg-rose-500/10 px-3 text-sm text-rose-100 hover:bg-rose-500/20"
+                      type="button"
+                      onClick={() => {
+                        for (const regression of plot.regressions) {
+                          onRemoveRegression(regression.id);
+                        }
+                      }}
+                    >
+                      Clear regressions
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {tool === 'area' && hasSamples ? (
+              <div>
+                <div className="mb-3 text-sm font-semibold text-slate-100">Area</div>
+                <div className="mb-4 grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] gap-3 rounded border border-slate-800 bg-slate-950 p-3 text-sm">
+                  <label className="self-center text-slate-400" htmlFor="area-channel">
+                    Line
+                  </label>
+                  <select
+                    id="area-channel"
+                    aria-label="Area channel"
+                    className="h-9 rounded border border-slate-700 bg-slate-900 px-2 text-slate-100 outline-none focus:border-sky-500"
+                    value={selectedChannelKey}
+                    onChange={(event) => setSelectedChannelKey(event.target.value)}
+                  >
+                    {signals.map((data) => (
+                      <option
+                        key={refKey({ datasetId: data.dataset_id, channelId: data.channel_id })}
+                        value={refKey({ datasetId: data.dataset_id, channelId: data.channel_id })}
+                      >
+                        {traceName(data)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="rounded border border-slate-800 bg-slate-950 p-4">
+                  <div className="mb-3 text-sm font-medium text-slate-100">
+                    {selectedSignal ? traceName(selectedSignal) : 'Select a channel'}
+                  </div>
+                  <dl className="grid max-w-lg grid-cols-2 gap-2 text-sm">
+                    <dt className="text-slate-500">Area</dt>
+                    <dd className="text-right font-mono text-slate-200">
+                      {formatAnalysisValue(area)}{' '}
+                      {selectedSignal?.unit ? `${selectedSignal.unit}·s` : ''}
+                    </dd>
+                    <dt className="text-slate-500">Duration</dt>
+                    <dd className="text-right font-mono text-slate-200">
+                      {formatAnalysisValue(duration)} s
+                    </dd>
+                    <dt className="text-slate-500">Average</dt>
+                    <dd className="text-right font-mono text-slate-200">
+                      {formatAnalysisValue(average)} {selectedSignal?.unit ?? ''}
+                    </dd>
+                    <dt className="text-slate-500">Samples</dt>
+                    <dd className="text-right font-mono text-slate-200">
+                      {selectedWindow.y.length}
+                    </dd>
+                  </dl>
+                  <div className="mt-4 flex items-center gap-2">
+                    <button
+                      className="h-8 rounded border border-slate-700 bg-slate-950 px-3 text-sm text-slate-300 hover:border-slate-500 disabled:text-slate-600"
+                      disabled={area === null}
+                      type="button"
+                      onClick={copyArea}
+                    >
+                      Copy area
+                    </button>
+                    {copyStatus ? (
+                      <span className="text-xs text-slate-500">{copyStatus}</span>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
   const [selectedDatasetId, setSelectedDatasetId] = useState<number | null>(null);
@@ -1675,6 +2364,7 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [activePlotId, setActivePlotId] = useState<string | null>(null);
   const [plotSummaries, setPlotSummaries] = useState<Record<string, PlotSummary>>({});
+  const [plotAnalysisData, setPlotAnalysisData] = useState<Record<string, PlotAnalysisData>>({});
   const [nextTabNumber, setNextTabNumber] = useState(2);
   const [nextPlotNumber, setNextPlotNumber] = useState(2);
   const [filter, setFilter] = useState<FilterConfig>(DEFAULT_FILTER);
@@ -1684,6 +2374,7 @@ export default function App() {
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
   const [renamingTabName, setRenamingTabName] = useState('');
   const [configuringPlotId, setConfiguringPlotId] = useState<string | null>(null);
+  const [analysisOpen, setAnalysisOpen] = useState(false);
   const [savedSnapshot, setSavedSnapshot] = useState<string | null>(null);
   const [datasetState, setDatasetState] = useState<LoadState>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -1716,6 +2407,7 @@ export default function App() {
     [configuringPlotId, tabs],
   );
   const activeSummary = activePlot ? plotSummaries[activePlot.id] : null;
+  const activeAnalysisData = activePlot ? (plotAnalysisData[activePlot.id] ?? null) : null;
 
   const updatePlot = useCallback((plotId: string, updater: (plot: PlotConfig) => PlotConfig) => {
     setTabs((currentTabs) =>
@@ -1736,6 +2428,10 @@ export default function App() {
 
   const handlePlotSummary = useCallback((plotId: string, summary: PlotSummary) => {
     setPlotSummaries((current) => ({ ...current, [plotId]: summary }));
+  }, []);
+
+  const handlePlotAnalysisData = useCallback((plotId: string, data: PlotAnalysisData) => {
+    setPlotAnalysisData((current) => ({ ...current, [plotId]: data }));
   }, []);
 
   useEffect(() => {
@@ -1775,6 +2471,7 @@ export default function App() {
         setNextPlotNumber(initialSession.nextPlotNumber);
         setSavedSnapshot(saved);
         setPlotSummaries({});
+        setPlotAnalysisData({});
         setDatasetState('ready');
       } catch (err) {
         if (cancelled) return;
@@ -1815,6 +2512,7 @@ export default function App() {
     setNextTabNumber(session.nextTabNumber);
     setNextPlotNumber(session.nextPlotNumber);
     setPlotSummaries({});
+    setPlotAnalysisData({});
   }, []);
 
   const handleNewSession = useCallback(() => {
@@ -1976,6 +2674,11 @@ export default function App() {
         delete next[plotId];
         return next;
       });
+      setPlotAnalysisData((current) => {
+        const next = { ...current };
+        delete next[plotId];
+        return next;
+      });
     },
     [activePlotId, tabs],
   );
@@ -2107,6 +2810,15 @@ export default function App() {
                 Split H
               </button>
             </div>
+
+            <button
+              className="h-8 rounded border border-slate-700 bg-slate-950 px-3 text-xs font-medium text-slate-300 hover:border-sky-500 hover:text-sky-100 disabled:text-slate-600"
+              disabled={!activePlot}
+              type="button"
+              onClick={() => setAnalysisOpen(true)}
+            >
+              Analysis Tools
+            </button>
 
             <div className="flex h-8 items-center gap-2 rounded border border-slate-800 bg-slate-950 px-2 text-xs">
               <label className="sr-only" htmlFor="plot-filter">
@@ -2240,6 +2952,7 @@ export default function App() {
                     onSplit={(direction) => splitPlot(plot.id, direction)}
                     onRemove={() => removePlot(plot.id)}
                     onUpdate={(updater) => updatePlot(plot.id, updater)}
+                    onAnalysisData={handlePlotAnalysisData}
                     onSummary={handlePlotSummary}
                   />
                 ))}
@@ -2266,6 +2979,28 @@ export default function App() {
             plot={configuringPlot}
             onCancel={() => setConfiguringPlotId(null)}
             onConfirm={confirmPlotData}
+          />
+        ) : null}
+        {analysisOpen && activePlot ? (
+          <AnalysisToolsDialog
+            analysisData={activeAnalysisData}
+            datasets={datasets}
+            plot={activePlot}
+            onAddRegression={(regression) =>
+              updatePlot(activePlot.id, (plot) => ({
+                ...plot,
+                regressions: [...plot.regressions, regression],
+              }))
+            }
+            onRemoveRegression={(regressionId) =>
+              updatePlot(activePlot.id, (plot) => ({
+                ...plot,
+                regressions: plot.regressions.filter(
+                  (regression) => regression.id !== regressionId,
+                ),
+              }))
+            }
+            onClose={() => setAnalysisOpen(false)}
           />
         ) : null}
       </div>
