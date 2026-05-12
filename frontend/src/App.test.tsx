@@ -91,6 +91,11 @@ const fullChamberData = {
   full_point_count: 5,
 };
 
+const filteredChamberData = {
+  ...chamberData,
+  y: [21.15, 14.1333, 21.1],
+};
+
 const thrustData = {
   ...chamberData,
   channel_id: 78,
@@ -150,6 +155,9 @@ function mockFetchForHappyPath() {
     if (url === '/api/datasets') return jsonResponse([datasetSummary]);
     if (url === '/api/datasets/1') return jsonResponse(datasetDetail);
     if (url === '/api/datasets/1/channels/68/data/full') return jsonResponse(fullChamberData);
+    if (url.includes('/channels/68/data') && url.includes('filter_kind=moving_average')) {
+      return jsonResponse(filteredChamberData);
+    }
     if (url.includes('/channels/68/data')) return jsonResponse(chamberData);
     if (url.includes('/channels/78/data')) return jsonResponse(thrustData);
     if (url.includes('/channels/13/data')) return jsonResponse(valveData);
@@ -178,7 +186,11 @@ describe('App', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/datasets');
     expect(fetchMock).toHaveBeenCalledWith('/api/datasets/1');
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/datasets/1/channels/68/data?max_points=4000',
+      expect.stringContaining('/api/datasets/1/channels/68/data?'),
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('max_points=4000'),
       expect.any(Object),
     );
 
@@ -202,7 +214,7 @@ describe('App', () => {
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/datasets/1/channels/78/data?max_points=4000',
+        expect.stringContaining('/api/datasets/1/channels/78/data?'),
         expect.any(Object),
       ),
     );
@@ -227,7 +239,14 @@ describe('App', () => {
         '/api/datasets/1/channels/68/data/full',
         expect.objectContaining({
           method: 'POST',
-          body: '{}',
+          body: JSON.stringify({
+            filter: {
+              kind: 'none',
+              cutoff_hz: 20,
+              order: 4,
+              window_samples: 25,
+            },
+          }),
         }),
       ),
     );
@@ -238,8 +257,8 @@ describe('App', () => {
     });
   });
 
-  it('applies client-side running average filtering to plotted traces', async () => {
-    mockFetchForHappyPath();
+  it('requests server-side filtered data for plotted traces', async () => {
+    const fetchMock = mockFetchForHappyPath();
 
     render(<App />);
     await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
@@ -254,10 +273,16 @@ describe('App', () => {
     await waitFor(() => {
       const [, traces, layout] = lastPlotlyCall();
       expect(layout.title.text).toContain('Avg 3 samples');
-      expect(traces[0].y[0]).toBeCloseTo(21.15);
-      expect(traces[0].y[1]).toBeCloseTo(14.1333);
-      expect(traces[0].y[2]).toBeCloseTo(21.1);
+      expect(traces[0].y).toEqual(filteredChamberData.y);
     });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('filter_kind=moving_average'),
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('window_samples=3'),
+      expect.any(Object),
+    );
   });
 
   it('applies selected valve overlays as Plotly shapes and annotations', async () => {
@@ -266,15 +291,22 @@ describe('App', () => {
     render(<App />);
     await waitFor(() => expect(plotlyReactMock).toHaveBeenCalled());
 
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter' }), {
+      target: { value: 'moving-average' },
+    });
     await screen.findByText('O-MV');
     clickCheckboxForText('O-MV');
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/datasets/1/channels/13/data?max_points=4000',
+        expect.stringContaining('/api/datasets/1/channels/13/data?'),
         expect.any(Object),
       ),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/datasets/1/channels/13/data?filter_kind=none'),
+      expect.any(Object),
     );
     await waitFor(() => {
       const [, traces, layout] = lastPlotlyCall();

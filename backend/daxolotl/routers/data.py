@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -11,10 +13,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from daxolotl.auth import CurrentUser, get_current_user
+from daxolotl.config import settings
 from daxolotl.db import get_db
 from daxolotl.decimation import decimate_min_max
 from daxolotl.models import Channel, Dataset
-from daxolotl.storage import read_channel_data
+from daxolotl.processing.filters import butterworth_lowpass, moving_average
+from daxolotl.storage import read_channel_data, read_xy_parquet, write_xy_parquet
 
 router = APIRouter(prefix="/api/datasets", tags=["data"])
 CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
@@ -35,9 +39,17 @@ class ChannelDataOut(BaseModel):
     full_point_count: int
 
 
+class FilterSpec(BaseModel):
+    kind: Literal["none", "butterworth", "moving_average"] = "none"
+    cutoff_hz: float = 20.0
+    order: int = 4
+    window_samples: int = 25
+
+
 class FullDataRequest(BaseModel):
     t_min: float | None = None
     t_max: float | None = None
+    filter: FilterSpec | None = None
 
 
 def _validate_window(t_min: float | None, t_max: float | None) -> None:
@@ -80,6 +92,55 @@ def _get_dataset_and_channel(
     return dataset, channel
 
 
+def _filter_cache_path(dataset: Dataset, channel: Channel, filter_spec: FilterSpec) -> Path:
+    source_path = Path(dataset.processed_path)
+    try:
+        source_stat = source_path.stat()
+    except FileNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Processed data cache not found") from exc
+
+    payload = {
+        "dataset_id": dataset.id,
+        "channel_id": channel.id,
+        "column": channel.column_name,
+        "source": str(source_path.resolve()),
+        "source_mtime_ns": source_stat.st_mtime_ns,
+        "source_size": source_stat.st_size,
+        "filter": filter_spec.model_dump(),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    return settings.data_dir.resolve() / ".processed" / "filters" / f"{digest}.parquet"
+
+
+def _apply_filter(dataset: Dataset, channel: Channel, filter_spec: FilterSpec) -> Path | None:
+    if filter_spec.kind == "none":
+        return None
+    if filter_spec.kind == "butterworth" and filter_spec.cutoff_hz <= 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "cutoff_hz must be greater than 0")
+    if filter_spec.kind == "butterworth" and filter_spec.order not in {2, 4}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "order must be 2 or 4")
+    if filter_spec.kind == "moving_average" and filter_spec.window_samples < 1:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "window_samples must be at least 1")
+
+    cache_path = _filter_cache_path(dataset, channel, filter_spec)
+    if cache_path.exists():
+        return cache_path
+
+    t, y = read_channel_data(Path(dataset.processed_path), channel.column_name)
+    if filter_spec.kind == "butterworth":
+        y_filtered = butterworth_lowpass(
+            t,
+            y,
+            cutoff_hz=filter_spec.cutoff_hz,
+            order=filter_spec.order,
+        )
+    else:
+        y_filtered = moving_average(y, filter_spec.window_samples)
+
+    write_xy_parquet(cache_path, t, y_filtered)
+    return cache_path
+
+
 def _read_out(
     dataset: Dataset,
     channel: Channel,
@@ -87,8 +148,14 @@ def _read_out(
     t_min: float | None,
     t_max: float | None,
     max_points: int | None,
+    filter_spec: FilterSpec | None = None,
 ) -> ChannelDataOut:
-    t, y = read_channel_data(Path(dataset.processed_path), channel.column_name, t_min, t_max)
+    filter_spec = filter_spec or FilterSpec()
+    filtered_path = _apply_filter(dataset, channel, filter_spec)
+    if filtered_path is None:
+        t, y = read_channel_data(Path(dataset.processed_path), channel.column_name, t_min, t_max)
+    else:
+        t, y = read_xy_parquet(filtered_path, t_min, t_max)
     full_point_count = int(len(t))
     decimated = False
 
@@ -119,6 +186,10 @@ def get_channel_data(
     t_min: float | None = None,
     t_max: float | None = None,
     max_points: MaxPointsQuery = 4000,
+    filter_kind: Literal["none", "butterworth", "moving_average"] = "none",
+    cutoff_hz: float = 20.0,
+    order: int = 4,
+    window_samples: int = 25,
 ) -> ChannelDataOut:
     """Return display-ready channel data, decimated with min/max binning if needed."""
     _validate_window(t_min, t_max)
@@ -132,6 +203,12 @@ def get_channel_data(
         t_min=t_min,
         t_max=t_max,
         max_points=max_points,
+        filter_spec=FilterSpec(
+            kind=filter_kind,
+            cutoff_hz=cutoff_hz,
+            order=order,
+            window_samples=window_samples,
+        ),
     )
 
 
@@ -152,4 +229,5 @@ def get_full_channel_data(
         t_min=req.t_min,
         t_max=req.t_max,
         max_points=None,
+        filter_spec=req.filter,
     )

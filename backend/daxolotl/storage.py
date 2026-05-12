@@ -72,3 +72,29 @@ def read_channel_data(
     if t_max is not None:
         mask &= t <= t_max
     return t[mask], y[mask]
+
+
+def write_xy_parquet(path: Path, t: np.ndarray, y: np.ndarray) -> None:
+    """Write a cached derived ``t``/``y`` series."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_arrays([pa.array(t), pa.array(y)], names=["t", "y"])
+    pq.write_table(table, path, compression="snappy")
+
+
+def read_xy_parquet(
+    path: Path,
+    t_min: float | None = None,
+    t_max: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read a cached derived ``t``/``y`` series, optionally clipped by time."""
+    table = pq.read_table(path, columns=["t", "y"])
+    t = table.column("t").to_numpy()
+    y = table.column("y").to_numpy()
+    if t_min is None and t_max is None:
+        return t, y
+    mask = np.ones(len(t), dtype=bool)
+    if t_min is not None:
+        mask &= t >= t_min
+    if t_max is not None:
+        mask &= t <= t_max
+    return t[mask], y[mask]

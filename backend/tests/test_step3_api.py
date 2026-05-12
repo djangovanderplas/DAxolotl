@@ -128,6 +128,46 @@ def test_full_channel_data_endpoint_uses_requested_window(
     assert max(body["t"]) <= 0.02
 
 
+def test_channel_data_endpoint_filters_and_caches_server_side(
+    monkeypatch,
+    tmp_path: Path,
+    synthetic_tdms: Path,
+) -> None:
+    with _client(monkeypatch, tmp_path) as client:
+        created = _ingest_synthetic(client, synthetic_tdms)
+        dataset_id = created["id"]
+        channel = next(ch for ch in created["channels"] if ch["name"] == "Chamber Eth")
+
+        response = client.get(
+            f"/api/datasets/{dataset_id}/channels/{channel['id']}/data",
+            params={
+                "filter_kind": "moving_average",
+                "window_samples": 11,
+                "max_points": 2000,
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["decimated"] is False
+        assert body["point_count"] == 1000
+        assert body["y"][0] != 0.0
+
+        filter_files = list((settings.data_dir / ".processed" / "filters").glob("*.parquet"))
+        assert len(filter_files) == 1
+
+        cached = client.get(
+            f"/api/datasets/{dataset_id}/channels/{channel['id']}/data",
+            params={
+                "filter_kind": "moving_average",
+                "window_samples": 11,
+                "max_points": 2000,
+            },
+        )
+        assert cached.status_code == 200
+        assert cached.json()["y"] == body["y"]
+        assert len(list((settings.data_dir / ".processed" / "filters").glob("*.parquet"))) == 1
+
+
 def test_dataset_and_channel_errors(monkeypatch, tmp_path: Path, synthetic_tdms: Path) -> None:
     with _client(monkeypatch, tmp_path) as client:
         not_found = client.post("/api/datasets", json={"path": "does-not-exist.tdms"})

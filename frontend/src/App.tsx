@@ -47,6 +47,16 @@ type FilterConfig = {
   windowSamples: number;
 };
 
+type TimeWindow = {
+  tMin: number;
+  tMax: number;
+};
+
+type PlotElement = HTMLDivElement & {
+  on?: (eventName: string, handler: (event: Record<string, unknown>) => void) => void;
+  removeListener?: (eventName: string, handler: (event: Record<string, unknown>) => void) => void;
+};
+
 const MAX_POINTS = 4000;
 const TRACE_COLORS = ['#38bdf8', '#f97316', '#a78bfa', '#22c55e', '#f43f5e', '#eab308'];
 const VALVE_COLORS = ['#facc15', '#fb7185', '#34d399', '#60a5fa', '#c084fc', '#f97316'];
@@ -191,91 +201,54 @@ function valveSummary(valves: ChannelData[]): string {
   return names.length > 8 ? `${shown} +${names.length - 8}` : shown;
 }
 
-function estimateSampleRate(t: number[]): number | null {
-  if (t.length < 2) return null;
-  const duration = t[t.length - 1] - t[0];
-  if (!Number.isFinite(duration) || duration <= 0) return null;
-  return (t.length - 1) / duration;
+function apiFilterKind(kind: FilterKind): 'none' | 'butterworth' | 'moving_average' {
+  return kind === 'moving-average' ? 'moving_average' : kind;
 }
 
-function movingAverage(y: number[], windowSamples: number): number[] {
-  const window = Number.isFinite(windowSamples) ? Math.max(1, Math.round(windowSamples)) : 1;
-  if (window <= 1 || y.length <= 2) return y;
-
-  const radius = Math.floor(window / 2);
-  const prefix = new Array<number>(y.length + 1).fill(0);
-  for (let i = 0; i < y.length; i += 1) {
-    prefix[i + 1] = prefix[i] + y[i];
+function addFilterParams(params: URLSearchParams, filter: FilterConfig) {
+  params.set('filter_kind', apiFilterKind(filter.kind));
+  if (filter.kind === 'butterworth') {
+    params.set('cutoff_hz', String(filter.cutoffHz));
+    params.set('order', String(filter.order));
   }
-
-  return y.map((_value, index) => {
-    const start = Math.max(0, index - radius);
-    const end = Math.min(y.length, index + radius + 1);
-    return (prefix[end] - prefix[start]) / (end - start);
-  });
+  if (filter.kind === 'moving-average') {
+    params.set('window_samples', String(filter.windowSamples));
+  }
 }
 
-function biquadLowpass(y: number[], sampleRate: number, cutoffHz: number, q: number): number[] {
-  const clampedCutoff = Math.min(Math.max(cutoffHz, 0.0001), sampleRate * 0.49);
-  const w0 = (2 * Math.PI * clampedCutoff) / sampleRate;
-  const cos = Math.cos(w0);
-  const sin = Math.sin(w0);
-  const alpha = sin / (2 * q);
-  const a0 = 1 + alpha;
-  const b0 = (1 - cos) / 2 / a0;
-  const b1 = (1 - cos) / a0;
-  const b2 = (1 - cos) / 2 / a0;
-  const a1 = (-2 * cos) / a0;
-  const a2 = (1 - alpha) / a0;
-
-  const out = new Array<number>(y.length);
-  let x1 = y[0] ?? 0;
-  let x2 = x1;
-  let y1 = x1;
-  let y2 = x1;
-  for (let i = 0; i < y.length; i += 1) {
-    const x0 = y[i];
-    const filtered = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-    out[i] = filtered;
-    x2 = x1;
-    x1 = x0;
-    y2 = y1;
-    y1 = filtered;
-  }
-  return out;
+function filterBody(filter: FilterConfig) {
+  return {
+    kind: apiFilterKind(filter.kind),
+    cutoff_hz: filter.cutoffHz,
+    order: filter.order,
+    window_samples: filter.windowSamples,
+  };
 }
 
-function butterworthLowpass(y: number[], t: number[], cutoffHz: number, order: 2 | 4): number[] {
-  const sampleRate = estimateSampleRate(t);
-  if (!sampleRate || !Number.isFinite(cutoffHz) || cutoffHz <= 0 || y.length <= 2) return y;
+function parseRelayoutWindow(event: Record<string, unknown>): TimeWindow | null | undefined {
+  if (event['xaxis.autorange']) return null;
 
-  const sections = order / 2;
-  let filtered = [...y];
-  for (let section = 0; section < sections; section += 1) {
-    const q = 1 / (2 * Math.cos(((2 * section + 1) * Math.PI) / (2 * order)));
-    filtered = biquadLowpass(filtered, sampleRate, cutoffHz, q);
+  const range = event['xaxis.range'];
+  if (Array.isArray(range) && range.length >= 2) {
+    const tMin = Number(range[0]);
+    const tMax = Number(range[1]);
+    return Number.isFinite(tMin) && Number.isFinite(tMax) ? { tMin, tMax } : undefined;
   }
 
-  filtered = [...filtered].reverse();
-  for (let section = 0; section < sections; section += 1) {
-    const q = 1 / (2 * Math.cos(((2 * section + 1) * Math.PI) / (2 * order)));
-    filtered = biquadLowpass(filtered, sampleRate, cutoffHz, q);
-  }
-  return filtered.reverse();
+  const tMin = Number(event['xaxis.range[0]']);
+  const tMax = Number(event['xaxis.range[1]']);
+  if (Number.isFinite(tMin) && Number.isFinite(tMax)) return { tMin, tMax };
+  return undefined;
 }
 
-function applyFilter(data: ChannelData, filter: FilterConfig): ChannelData {
-  if (filter.kind === 'none') return data;
-
-  const y =
-    filter.kind === 'moving-average'
-      ? movingAverage(data.y, filter.windowSamples)
-      : butterworthLowpass(data.y, data.t, filter.cutoffHz, filter.order);
-  return { ...data, y };
+function maxPointsForPlotWidth(width: number): number {
+  if (width < 100) return MAX_POINTS;
+  return Math.round(Math.min(12000, Math.max(2000, width * 3)));
 }
 
 export default function App() {
   const plotRef = useRef<HTMLDivElement | null>(null);
+  const relayoutTimerRef = useRef<number | null>(null);
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
   const [selectedDatasetId, setSelectedDatasetId] = useState<number | null>(null);
   const [draftSignalIds, setDraftSignalIds] = useState<number[]>([]);
@@ -285,6 +258,8 @@ export default function App() {
   const [plotValveIds, setPlotValveIds] = useState<number[]>([]);
   const [plotResolution, setPlotResolution] = useState<PlotResolution>('fast');
   const [filter, setFilter] = useState<FilterConfig>(DEFAULT_FILTER);
+  const [visibleWindow, setVisibleWindow] = useState<TimeWindow | null>(null);
+  const [displayMaxPoints, setDisplayMaxPoints] = useState(MAX_POINTS);
   const [signalData, setSignalData] = useState<ChannelData[]>([]);
   const [valveData, setValveData] = useState<ChannelData[]>([]);
   const [datasetState, setDatasetState] = useState<LoadState>('idle');
@@ -311,10 +286,6 @@ export default function App() {
     draftResolution !== plotResolution;
   const totalDisplayedPoints = signalData.reduce((total, data) => total + data.point_count, 0);
   const totalFullPoints = signalData.reduce((total, data) => total + data.full_point_count, 0);
-  const plottedSignalData = useMemo(
-    () => signalData.map((data) => applyFilter(data, filter)),
-    [signalData, filter],
-  );
 
   useEffect(() => {
     let cancelled = false;
@@ -347,6 +318,7 @@ export default function App() {
         setPlotSignalIds(defaultSignals);
         setPlotValveIds([]);
         setPlotResolution('fast');
+        setVisibleWindow(null);
         setDatasetState('ready');
       } catch (err) {
         if (cancelled) return;
@@ -375,8 +347,27 @@ export default function App() {
       setError(null);
       try {
         const ids = [...plotSignalIds, ...plotValveIds];
+        const signalIdSet = new Set(plotSignalIds);
         const responses = await Promise.all(
           ids.map(async (channelId) => {
+            const channelFilter = signalIdSet.has(channelId) ? filter : DEFAULT_FILTER;
+            const params = new URLSearchParams();
+            addFilterParams(params, channelFilter);
+            if (visibleWindow) {
+              params.set('t_min', String(visibleWindow.tMin));
+              params.set('t_max', String(visibleWindow.tMax));
+            }
+            params.set('max_points', String(displayMaxPoints));
+
+            const fullBody = {
+              ...(visibleWindow
+                ? {
+                    t_min: visibleWindow.tMin,
+                    t_max: visibleWindow.tMax,
+                  }
+                : {}),
+              filter: filterBody(channelFilter),
+            };
             const response =
               plotResolution === 'full'
                 ? await fetch(
@@ -384,12 +375,12 @@ export default function App() {
                     {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({}),
+                      body: JSON.stringify(fullBody),
                       signal: controller.signal,
                     },
                   )
                 : await fetch(
-                    `/api/datasets/${selectedDatasetId}/channels/${channelId}/data?max_points=${MAX_POINTS}`,
+                    `/api/datasets/${selectedDatasetId}/channels/${channelId}/data?${params.toString()}`,
                     { signal: controller.signal },
                   );
             if (!response.ok) throw new Error(`Channel data HTTP ${response.status}`);
@@ -398,7 +389,6 @@ export default function App() {
         );
 
         if (controller.signal.aborted) return;
-        const signalIdSet = new Set(plotSignalIds);
         setSignalData(responses.filter((data) => signalIdSet.has(data.channel_id)));
         setValveData(responses.filter((data) => !signalIdSet.has(data.channel_id)));
         setPlotState('ready');
@@ -411,20 +401,28 @@ export default function App() {
 
     void loadPlotData();
     return () => controller.abort();
-  }, [selectedDatasetId, plotSignalIds, plotValveIds, plotResolution]);
+  }, [
+    selectedDatasetId,
+    plotSignalIds,
+    plotValveIds,
+    plotResolution,
+    filter,
+    visibleWindow,
+    displayMaxPoints,
+  ]);
 
   useEffect(() => {
     const plot = plotRef.current;
-    if (!plot || plottedSignalData.length === 0) return;
+    if (!plot || signalData.length === 0) return;
 
-    const units = [...new Set(plottedSignalData.map((data) => data.unit).filter(Boolean))];
+    const units = [...new Set(signalData.map((data) => data.unit).filter(Boolean))];
     const yLabel = units.length === 1 ? `Signals [${units[0]}]` : 'Signals';
     const { shapes, annotations } = buildValveOverlay(valveData);
     const { signalTop } = overlayDomain(valveData.length);
     const titleText =
-      plottedSignalData.length === 1
-        ? `${plottedSignalData[0].group_name} / ${plottedSignalData[0].channel_name}`
-        : `${plottedSignalData.length} traces`;
+      signalData.length === 1
+        ? `${signalData[0].group_name} / ${signalData[0].channel_name}`
+        : `${signalData.length} traces`;
     const overlayText = valveSummary(valveData);
     const filterText =
       filter.kind === 'none'
@@ -435,7 +433,7 @@ export default function App() {
 
     void Plotly.react(
       plot,
-      plottedSignalData.map((data, index) => ({
+      signalData.map((data, index) => ({
         x: data.t,
         y: data.y,
         type: 'scattergl',
@@ -449,11 +447,12 @@ export default function App() {
         paper_bgcolor: '#020617',
         plot_bgcolor: '#0f172a',
         font: { color: '#cbd5e1', family: 'Inter, ui-sans-serif, system-ui' },
+        uirevision: 'plot-1',
         margin: {
           l: 72,
           r: 28,
           t: valveData.length > 0 ? 82 : 52,
-          b: plottedSignalData.length > 5 ? 88 : 60,
+          b: signalData.length > 5 ? 88 : 60,
         },
         title: {
           text: overlayText
@@ -478,11 +477,11 @@ export default function App() {
         hovermode: 'x unified',
         showlegend: true,
         legend: {
-          orientation: plottedSignalData.length > 5 ? 'h' : 'v',
-          x: plottedSignalData.length > 5 ? 0 : 1,
-          xanchor: plottedSignalData.length > 5 ? 'left' : 'right',
-          y: plottedSignalData.length > 5 ? -0.18 : signalTop - 0.02,
-          yanchor: plottedSignalData.length > 5 ? 'top' : 'top',
+          orientation: signalData.length > 5 ? 'h' : 'v',
+          x: signalData.length > 5 ? 0 : 1,
+          xanchor: signalData.length > 5 ? 'left' : 'right',
+          y: signalData.length > 5 ? -0.18 : signalTop - 0.02,
+          yanchor: signalData.length > 5 ? 'top' : 'top',
           bgcolor: 'rgba(2, 6, 23, 0.74)',
           bordercolor: '#334155',
           borderwidth: 1,
@@ -497,18 +496,49 @@ export default function App() {
         scrollZoom: true,
       },
     );
-  }, [plottedSignalData, valveData, filter]);
+  }, [signalData, valveData, filter]);
 
   useEffect(() => {
     const plot = plotRef.current;
     if (!plot) return;
 
+    const syncMaxPoints = () => {
+      const nextMaxPoints = maxPointsForPlotWidth(plot.clientWidth);
+      setDisplayMaxPoints((current) => (current === nextMaxPoints ? current : nextMaxPoints));
+    };
+    syncMaxPoints();
+
     const resizeObserver = new ResizeObserver(() => {
+      syncMaxPoints();
       void Plotly.Plots.resize(plot);
     });
     resizeObserver.observe(plot);
     return () => resizeObserver.disconnect();
   }, []);
+
+  useEffect(() => {
+    const plot = plotRef.current as PlotElement | null;
+    if (!plot?.on) return;
+
+    const handleRelayout = (event: Record<string, unknown>) => {
+      const nextWindow = parseRelayoutWindow(event);
+      if (nextWindow === undefined) return;
+      if (relayoutTimerRef.current !== null) {
+        window.clearTimeout(relayoutTimerRef.current);
+      }
+      relayoutTimerRef.current = window.setTimeout(() => {
+        setVisibleWindow(nextWindow);
+      }, 200);
+    };
+
+    plot.on('plotly_relayout', handleRelayout);
+    return () => {
+      if (relayoutTimerRef.current !== null) {
+        window.clearTimeout(relayoutTimerRef.current);
+      }
+      plot.removeListener?.('plotly_relayout', handleRelayout);
+    };
+  }, [signalData.length]);
 
   const handleDatasetChange = useCallback(
     (datasetId: number) => {
@@ -521,6 +551,7 @@ export default function App() {
       setPlotSignalIds(defaultSignals);
       setPlotValveIds([]);
       setPlotResolution('fast');
+      setVisibleWindow(null);
     },
     [datasets],
   );
