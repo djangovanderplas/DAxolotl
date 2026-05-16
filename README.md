@@ -1,90 +1,163 @@
 # DAxolotl
 
-Web-based test data analysis tool for rocket engine hotfires and coldflows. Loads
-National Instruments DAQ TDMS files, plots channels with valve/sequence overlays,
-runs custom math, and saves view configs.
+Web-based test data analysis tool for engine hotfires and
+coldflows. DAxolotl can use NI TDMS files, converts raw DAQ
+channels into engineering units, caches processed data in Parquet, and provides
+a browser UI for plotting, filtering, cursors, valve overlays, and analysis.
 
-This is the MVP — single-user, runs on `localhost`, reads from `./data/`.
+DAxolotl is currently an MVP for a single user on `localhost`. It reads raw test
+files from `./data/` and stores metadata in local SQLite.
 
-## Setup
+## Current Status
 
-Requires **Python 3.11+** and **Node 20+**.
+Implemented:
+
+- FastAPI backend with SQLite metadata, TDMS ingest, Parquet cache, and typed
+  channel data endpoints.
+- TDMS loader for group timebases, packed valves, pressure/load-cell conversion,
+  thermocouples, and the active sequence channel.
+- React/Vite frontend with multi-tab plots, split plot grids, multi-dataset
+  channel selection, valve overlays, server-side filters, cursor readouts, and
+  browser-local session save/open.
+- Analysis tools for regression, area, statistics, FFT/PSD, spectrogram, and
+  histogram.
+
+Not implemented yet:
+
+- Python scripting runtime and derived-channel API.
+- Backend-backed saved views.
+- Annotation UI/API, sequence-step overlay, export flow, and pipeline runner.
+
+## Install for a New Developer
+
+Prerequisites:
+
+- Conda or Mamba.
+- Git.
+
+Recommended setup from a fresh clone:
 
 ```bash
-make install          # pip install -e ".[dev]"  +  npm install
-cp .env.example .env  # optional — defaults are fine
+git clone git@github.com:djangovanderplas/DAxolotl.git
+cd DAxolotl
+conda env create -f environment.yml
+conda activate DAxolotl
+cd frontend && npm install && cd ..
+cp .env.example .env  # optional; defaults are usable
 ```
+
+The conda environment installs Python 3.11, Node 20+, and the Python package in
+editable development mode with dev tools. The separate `npm install` installs
+the frontend dependencies from `frontend/package-lock.json`.
+
+If the environment already exists:
+
+```bash
+conda activate DAxolotl
+conda env update -f environment.yml --prune
+cd frontend && npm install && cd ..
+```
+
+Alternative without conda:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+cd frontend && npm install && cd ..
+```
+
+Use Python 3.11+ and Node 20+ if you choose the non-conda route.
 
 ## Run
 
+Start backend and frontend together:
+
 ```bash
-make dev              # backend on :8000, frontend on :5173, concurrently
-# or, in two terminals:
+conda activate DAxolotl
+make dev
+```
+
+Or run them in separate terminals:
+
+```bash
+conda activate DAxolotl
 make backend
+
+conda activate DAxolotl
 make frontend
 ```
 
-Open <http://localhost:5173>. The frontend proxies `/api/*` to the backend.
+Open <http://localhost:5173>. The Vite dev server proxies `/api/*` requests to
+the backend on port `8000`.
 
-## Test / lint
+## Add Data
+
+Raw test files are intentionally not tracked by git. Put one TDMS file under a
+test folder:
 
 ```bash
-make test             # backend pytest + frontend vitest
-make test-backend     # pytest backend/tests
-make test-frontend    # cd frontend && npm test
-make lint             # ruff + prettier
-make format           # auto-fix
+mkdir -p data/HF16
+cp /path/to/file.tdms data/HF16/
 ```
 
-## Project structure
+Register the dataset with the CLI:
 
-```
-backend/daxolotl/    FastAPI app + loaders + processing + scripting + pipelines
-backend/tests/       pytest suite (incl. TDMS fixtures)
-frontend/src/        React + Vite + Tailwind UI
-data/                test data (gitignored)
+```bash
+conda activate DAxolotl
+daxolotl ingest ./data/HF16 --name "HF16"
 ```
 
-See [`DAxolotl_prompt.md`](DAxolotl_prompt.md) for the full design brief.
+Processed Parquet caches are written under `data/.processed/` and are also not
+tracked by git.
 
-## TDMS file-format quirks (future me, read this)
+## Test and Lint
 
-Documented in detail in `backend/daxolotl/loaders/tdms.py` once written
-(build-plan step 2). Summary of the gotchas:
+```bash
+conda activate DAxolotl
+make test             # backend pytest + frontend Vitest
+make test-backend     # backend pytest only
+make test-frontend    # frontend Vitest only
+make lint             # Ruff + Prettier checks
+make format           # Ruff + Prettier auto-format
+```
 
-1. **Valves are bit-packed.** `Digital Outputs/Digital Outputs` is a uint32 with
-   `Valve names` + `Unpowered states` properties — unpack into 32 boolean channels,
-   XOR with unpowered state.
-2. **Each group has its own `Ticks [us]` channel.** Independent timebases — merge
-   onto a common axis (max-resolution group as the anchor, nearest-neighbour
-   resample the rest), zero at start.
-3. **Pressure / load cell `_slope` and `_offset`** properties give engineering
-   units: `value = raw / slope + offset` (note: *divide* by slope).
-4. **Thermocouple `_type` (`K`, `T`, …)** + `Autozero` / `CJC` channels in the
-   `Thermocouples` group. MVP uses polynomial approximation with CJC compensation;
-   `# TODO(post-mvp):` swap in NIST ITS-90 coefficients.
-5. **`General/Active Sequence Step`** is a step-function int — surface as a
-   first-class "sequence step" overlay.
+The real-file TDMS integration test skips when no matching local TDMS file is
+present. Synthetic TDMS tests do not require external data.
 
-## Scripting sandbox
+## Project Structure
 
-`scripting/runtime.py` exposes `numpy`, a `channels` namespace, and helpers
-(`butter`, `moving_avg`, `differentiate`, etc.) to a restricted `exec()`.
+```text
+backend/daxolotl/    FastAPI app, loaders, processing, routers, storage
+backend/tests/       pytest suite with synthetic TDMS fixtures
+frontend/src/        React + Vite + Tailwind + Zustand + Plotly UI
+data/                local raw and processed data; gitignored except .gitkeep
+```
 
-**This is a trusted-user sandbox.** No isolation, no resource limits. Fine for a
-team of pilots / engineers on a LAN. Before any public deployment, swap for
-`RestrictedPython` or a subprocess sandbox. See `# TODO(post-mvp):` markers.
+## TDMS File-Format Notes
 
-## Roadmap (post-MVP)
+These details are verified against current loader behavior:
 
-- Real auth / org SSO
-- Flight recorder data (IMU/GPS/baro), 2D/3D map view
-- Theoretical model comparison tooling
-- Drag-and-drop pipeline editor
-- Sandboxed script execution
-- NIST ITS-90 thermocouple coefficients
-- Nextcloud / network storage
-- Audit log of uploads / script runs
-- Test campaign grouping
-- Unit-aware math
-- Postgres migration
+1. **Valves are bit-packed.** `Digital Outputs/Digital Outputs` is a `uint32`
+   with `Valve names` and `Unpowered states` properties. DAxolotl unpacks 32
+   boolean valve channels and XORs each bit with its unpowered state so `1`
+   means commanded open.
+2. **Groups can have separate `Ticks [us]` channels.** Observed files have
+   aligned ticks, but the loader still handles divergent group timebases with
+   nearest-neighbor alignment onto the longest group timebase.
+3. **Pressure and load-cell conversion is multiply.** Engineering units are
+   computed as `value = raw * slope + offset`.
+4. **Thermocouples use the NI 9213 chain.** DAxolotl applies CJC thermistor
+   conversion, autozero compensation, and K/T lookup-table interpolation.
+5. **`General/Active Sequence Step` is surfaced raw.** It appears to be a
+   monotonic counter in current files, so UI interpretation is deferred.
+
+## Local Files and Git
+
+The repository tracks source code, tests, package metadata, and `data/.gitkeep`.
+It intentionally ignores:
+
+- Raw TDMS data and processed Parquet caches.
+- SQLite databases and local environment files.
+- Generated Python, Node, Vite, and TypeScript build artifacts.
+- Read-only legacy/reference material outside the app source tree.
