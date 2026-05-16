@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from daxolotl import __version__
 from daxolotl.db import init_db
-from daxolotl.routers import data, datasets
+from daxolotl.routers import data, datasets, scripts
 
 
 @asynccontextmanager
@@ -31,6 +31,7 @@ app.add_middleware(
 
 app.include_router(datasets.router)
 app.include_router(data.router)
+app.include_router(scripts.router)
 
 
 @app.get("/api/health")

@@ -21,10 +21,11 @@ Implemented:
   browser-local session save/open.
 - Analysis tools for regression, area, statistics, FFT/PSD, spectrogram, and
   histogram.
+- Backend trusted-user Python scripting endpoint for cached derived channels.
 
 Not implemented yet:
 
-- Python scripting runtime and derived-channel API.
+- Frontend script editor UI.
 - Backend-backed saved views.
 - Annotation UI/API, sequence-step overlay, export flow, and pipeline runner.
 
@@ -110,6 +111,24 @@ daxolotl ingest ./data/HF16 --name "HF16"
 
 Processed Parquet caches are written under `data/.processed/` and are also not
 tracked by git.
+
+## Derived Channels
+
+The backend exposes a trusted-user Python scripting endpoint:
+
+```bash
+curl -X POST http://localhost:8000/api/datasets/1/script \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Double chamber","code":"channels[\"Pressure Sensors/Chamber Eth\"] * 2"}'
+```
+
+Scripts can read source arrays from `channels["Group/Channel"]`, use `t` for
+the common time array, and expose outputs as the final expression or variables
+named with an `out_` prefix. Outputs are cached as Parquet-derived channels and
+can be fetched through the normal channel data endpoints.
+
+This is a trusted-user execution path with no isolation, timeout, or resource
+limits. Only run scripts from people you trust on machines you control.
 
 ## Test and Lint
 

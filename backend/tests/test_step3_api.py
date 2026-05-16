@@ -7,7 +7,7 @@ from daxolotl.cli import app as cli_app
 from daxolotl.config import settings
 from daxolotl.ingest import resolve_ingest_path
 from daxolotl.main import app
-from daxolotl.models import Channel, Dataset, Group, User
+from daxolotl.models import Channel, Dataset, DerivedChannel, Group, User
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 from typer.testing import CliRunner
@@ -214,6 +214,65 @@ def test_channel_data_endpoint_accepts_butterworth_query_params(
             },
         )
         assert invalid_order.status_code == 400
+
+
+def test_dataset_script_creates_cached_derived_channel(
+    monkeypatch,
+    tmp_path: Path,
+    synthetic_tdms: Path,
+) -> None:
+    with _client(monkeypatch, tmp_path) as client:
+        created = _ingest_synthetic(client, synthetic_tdms)
+        dataset_id = created["id"]
+
+        script_response = client.post(
+            f"/api/datasets/{dataset_id}/script",
+            json={
+                "name": "Double chamber",
+                "code": 'channels["Pressure Sensors/Chamber Eth"] * 2',
+            },
+        )
+        assert script_response.status_code == 201, script_response.text
+        channel = script_response.json()["channels"][0]
+        assert channel["group_name"] == "Derived"
+        assert channel["name"] == "Double chamber"
+        assert channel["sample_count"] == 1000
+
+        data_response = client.get(
+            f"/api/datasets/{dataset_id}/channels/{channel['id']}/data",
+            params={"max_points": 2000},
+        )
+        assert data_response.status_code == 200, data_response.text
+        body = data_response.json()
+        assert body["channel_name"] == "Double chamber"
+        assert body["y"][0] == 0.0
+        assert body["y"][-1] == 60.0
+
+        with db_module.SessionLocal() as db:
+            derived = db.query(DerivedChannel).filter_by(name="Double chamber").one()
+            assert derived.cache_path is not None
+            assert Path(derived.cache_path).exists()
+            registered = db.get(Channel, channel["id"])
+            assert registered is not None
+            assert Path(registered.properties_json["derived_cache_path"]).exists()
+
+
+def test_dataset_script_rejects_wrong_length_output(
+    monkeypatch,
+    tmp_path: Path,
+    synthetic_tdms: Path,
+) -> None:
+    with _client(monkeypatch, tmp_path) as client:
+        created = _ingest_synthetic(client, synthetic_tdms)
+        dataset_id = created["id"]
+
+        response = client.post(
+            f"/api/datasets/{dataset_id}/script",
+            json={"name": "Bad derived", "code": "np.array([1.0, 2.0])"},
+        )
+
+    assert response.status_code == 400
+    assert "does not match time length" in response.json()["detail"]
 
 
 def test_dataset_and_channel_errors(monkeypatch, tmp_path: Path, synthetic_tdms: Path) -> None:

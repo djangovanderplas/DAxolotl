@@ -93,7 +93,7 @@ def _get_dataset_and_channel(
 
 
 def _filter_cache_path(dataset: Dataset, channel: Channel, filter_spec: FilterSpec) -> Path:
-    source_path = Path(dataset.processed_path)
+    source_path = _source_path_for_channel(dataset, channel)
     try:
         source_stat = source_path.stat()
     except FileNotFoundError as exc:
@@ -126,7 +126,7 @@ def _apply_filter(dataset: Dataset, channel: Channel, filter_spec: FilterSpec) -
     if cache_path.exists():
         return cache_path
 
-    t, y = read_channel_data(Path(dataset.processed_path), channel.column_name)
+    t, y = _read_source_data(dataset, channel)
     if filter_spec.kind == "butterworth":
         y_filtered = butterworth_lowpass(
             t,
@@ -153,7 +153,7 @@ def _read_out(
     filter_spec = filter_spec or FilterSpec()
     filtered_path = _apply_filter(dataset, channel, filter_spec)
     if filtered_path is None:
-        t, y = read_channel_data(Path(dataset.processed_path), channel.column_name, t_min, t_max)
+        t, y = _read_source_data(dataset, channel, t_min, t_max)
     else:
         t, y = read_xy_parquet(filtered_path, t_min, t_max)
     full_point_count = int(len(t))
@@ -175,6 +175,29 @@ def _read_out(
         point_count=int(len(t)),
         full_point_count=full_point_count,
     )
+
+
+def _derived_cache_path(channel: Channel) -> Path | None:
+    path = (channel.properties_json or {}).get("derived_cache_path")
+    return Path(path) if isinstance(path, str) and path else None
+
+
+def _source_path_for_channel(dataset: Dataset, channel: Channel) -> Path:
+    return _derived_cache_path(channel) or Path(dataset.processed_path)
+
+
+def _read_source_data(
+    dataset: Dataset,
+    channel: Channel,
+    t_min: float | None = None,
+    t_max: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    derived_path = _derived_cache_path(channel)
+    if derived_path is not None:
+        if not derived_path.exists():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Derived data cache not found")
+        return read_xy_parquet(derived_path, t_min, t_max)
+    return read_channel_data(Path(dataset.processed_path), channel.column_name, t_min, t_max)
 
 
 @router.get("/{dataset_id}/channels/{channel_id}/data")
