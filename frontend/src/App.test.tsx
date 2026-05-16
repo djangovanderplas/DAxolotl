@@ -88,17 +88,17 @@ const chamberData = {
   channel_name: 'Chamber Eth',
   group_name: 'Pressure Sensors',
   unit: 'bar',
-  t: [0, 1, 2],
-  y: [0.2, 42.1, 0.1],
+  t: [0, 1, 2, 3],
+  y: [0.2, 42.1, 0.1, 0.2],
   decimated: true,
-  point_count: 3,
+  point_count: 4,
   full_point_count: 1_157_937,
 };
 
 const secondChamberData = {
   ...chamberData,
   dataset_id: 2,
-  y: [0.4, 38.2, 0.3],
+  y: [0.4, 38.2, 0.3, 0.4],
   full_point_count: 900_000,
 };
 
@@ -113,7 +113,7 @@ const fullChamberData = {
 
 const filteredChamberData = {
   ...chamberData,
-  y: [21.15, 14.1333, 21.1],
+  y: [21.15, 14.1333, 21.1, 21.15],
 };
 
 const thrustData = {
@@ -122,7 +122,7 @@ const thrustData = {
   channel_name: 'Thrust',
   group_name: 'Load Cells',
   unit: 'N',
-  y: [0, 13_900, 10],
+  y: [0, 13_900, 10, 12],
 };
 
 const valveData = {
@@ -138,12 +138,21 @@ const valveData = {
 
 type PlotlyTraceCall = [
   HTMLElement,
-  Array<{ name: string; x: number[]; y: number[]; hovertemplate?: string }>,
+  Array<{
+    name?: string;
+    x: number[];
+    y: number[];
+    z?: number[][];
+    type?: string;
+    hovertemplate?: string;
+  }>,
   {
     title: { text: string };
     annotations?: Array<{ text?: string }>;
     shapes?: Array<Record<string, unknown>>;
     hovermode?: string;
+    xaxis?: { title?: { text: string }; type?: string };
+    yaxis?: { title?: { text: string }; type?: string };
   },
 ];
 
@@ -547,7 +556,7 @@ describe('App', () => {
       await plotSelectedSignals('Chamber Eth');
       fireEvent.click(screen.getByRole('button', { name: 'Cursor A' }));
 
-      expect(await screen.findByText(/A: t = 0.667 s/)).toBeInTheDocument();
+      expect(await screen.findByText(/A: t = 1.00 s/)).toBeInTheDocument();
       await waitFor(() => {
         const [, , layout] = lastPlotlyCall();
         expect(layout.shapes?.[0]).toMatchObject({
@@ -641,6 +650,129 @@ describe('App', () => {
 
     await waitFor(() => {
       expect(writeText).toHaveBeenCalledWith(expect.stringContaining('area='));
+    });
+  });
+
+  it('calculates statistics for a selected trace and copies values', async () => {
+    mockFetchForHappyPath();
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      clipboard: { writeText },
+    });
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analysis Tools' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Statistics' }));
+    expect(within(dialog).getByRole('combobox', { name: 'Statistics channel' })).toHaveValue(
+      '1:68',
+    );
+    expect(within(dialog).getByText('Central tendency')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Dispersion' }));
+    expect(within(dialog).getByText('Standard deviation')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getAllByRole('button', { name: 'Copy' })[0]);
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith('0.0000000000000000');
+    });
+  });
+
+  it('switches a plot to spectrogram mode with configurable options', async () => {
+    mockFetchForHappyPath();
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth');
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Plot type' }), {
+      target: { value: 'spectrogram' },
+    });
+    fireEvent.change(await screen.findByRole('spinbutton', { name: 'Spectrogram nperseg' }), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByLabelText('Log f'));
+
+    await waitFor(() => {
+      const [, traces, layout] = lastPlotlyCall();
+      expect(traces[0].type).toBe('heatmap');
+      expect(traces[0].z?.length).toBeGreaterThan(0);
+      expect(layout.yaxis?.type).toBe('log');
+      expect(layout.yaxis?.title).toEqual({ text: 'Frequency [Hz]' });
+    });
+  });
+
+  it('plots an FFT with magnitude and phase options', async () => {
+    mockFetchForHappyPath();
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analysis Tools' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'FFT' }));
+    expect(within(dialog).getByRole('combobox', { name: 'FFT channel' })).toHaveValue('1:68');
+    await waitFor(() => {
+      const [, traces, layout] = lastPlotlyCall();
+      expect(traces[0].name).toBe('Magnitude');
+      expect(traces[0].x[0]).toBeGreaterThan(0);
+      expect(layout.yaxis?.title).toEqual({ text: 'Magnitude' });
+    });
+    fireEvent.click(within(dialog).getByLabelText('Phase'));
+
+    await waitFor(() => {
+      const [, traces, layout] = lastPlotlyCall();
+      expect(traces.map((trace) => trace.name)).toEqual(['Magnitude', 'Phase']);
+      expect(layout.xaxis?.title).toEqual({ text: 'Frequency [Hz]' });
+    });
+  });
+
+  it('applies FFT display controls for dB, log frequency, and Welch PSD', async () => {
+    mockFetchForHappyPath();
+
+    render(<App />);
+    await plotSelectedSignals('Chamber Eth');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analysis Tools' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'FFT' }));
+
+    let linearY = 0;
+    await waitFor(() => {
+      const [, traces] = lastPlotlyCall();
+      linearY = traces[0].y[0];
+      expect(linearY).toBeGreaterThanOrEqual(0);
+    });
+
+    fireEvent.click(within(dialog).getByLabelText('dB'));
+    await waitFor(() => {
+      const [, traces, layout] = lastPlotlyCall();
+      expect(traces[0].y[0]).toBeCloseTo(20 * Math.log10(Math.max(linearY, 1e-12)), 8);
+      expect(layout.yaxis?.title).toEqual({ text: 'Magnitude [dB]' });
+    });
+
+    fireEvent.click(within(dialog).getByLabelText('Log frequency'));
+    await waitFor(() => {
+      const [, traces, layout] = lastPlotlyCall();
+      expect(layout.xaxis?.type).toBe('log');
+      expect(traces[0].x.every((frequency) => frequency > 0)).toBe(true);
+    });
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'PSD (Welch)' }));
+    fireEvent.click(within(dialog).getByLabelText('dB'));
+    fireEvent.change(within(dialog).getByLabelText('Welch nperseg'), {
+      target: { value: '4' },
+    });
+    fireEvent.change(within(dialog).getByLabelText('Welch window'), {
+      target: { value: 'boxcar' },
+    });
+    await waitFor(() => {
+      const [, traces, layout] = lastPlotlyCall();
+      expect(traces.map((trace) => trace.name)).toEqual(['PSD (Welch)']);
+      expect(layout.yaxis?.title?.text).toContain('PSD');
+      expect(traces[0].x.every((frequency) => frequency > 0)).toBe(true);
+      expect(traces[0].y.every((value) => value >= 0)).toBe(true);
     });
   });
 
